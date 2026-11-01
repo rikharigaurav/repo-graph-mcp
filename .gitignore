@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.env
+ui-src/node_modules/
+# the built view (src/repo_graph_mcp/ui/graph-view.html) IS committed so installs need no Node

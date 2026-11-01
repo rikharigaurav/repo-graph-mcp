@@ -1,0 +1,14 @@
+{
+  "name": "repo-graph-mcp",
+  "description": "Repository structure graphs rendered inside Claude",
+  "owner": {
+    "name": "rikharigaurav"
+  },
+  "plugins": [
+    {
+      "name": "repo-graph",
+      "source": "./",
+      "description": "Parse a repository into a code-structure graph and explore it interactively in the chat"
+    }
+  ]
+}

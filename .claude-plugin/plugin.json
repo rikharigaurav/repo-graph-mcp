@@ -1,0 +1,11 @@
+{
+  "name": "repo-graph",
+  "version": "0.1.0",
+  "description": "Share a repo with Claude and get its code-structure graph (folders, files, classes, functions, API endpoints, calls, imports, tests) as an interactive view right in the chat. Graph only: no LLM summaries or embeddings, so it takes seconds.",
+  "author": {
+    "name": "rikharigaurav"
+  },
+  "repository": "https://github.com/rikharigaurav/repo-graph-mcp",
+  "license": "MIT",
+  "keywords": ["mcp", "mcp-apps", "code-graph", "repository", "architecture", "tree-sitter", "neo4j"]
+}

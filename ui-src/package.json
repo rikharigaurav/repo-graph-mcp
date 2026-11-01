@@ -1,0 +1,20 @@
+{
+  "name": "repo-graph-view",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Single-file MCP App view for repo-graph-mcp. Built into src/repo_graph_mcp/ui/graph-view.html.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "d3-force": "3.0.0"
+  },
+  "devDependencies": {
+    "@types/d3-force": "3.0.10",
+    "esbuild": "0.25.10",
+    "typescript": "5.9.3"
+  }
+}
