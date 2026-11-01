@@ -47,10 +47,18 @@ function applyHostContext(ctx: HostContext): void {
   requestAnimationFrame(() => view?.readPalette());
 }
 
+let standalone = false; // opened as its own page (artifact / browser tab) rather than inside an MCP host
+
 function sizeToHost(): void {
   const ctx = bridge.hostContext;
   const app = $("#app");
-  if (ctx.displayMode === "fullscreen") {
+  if (standalone) {
+    // one-screen page: fill the window (100% rather than 100vh, so an artifact's safe-area padding fits)
+    document.documentElement.style.height = "100%";
+    document.body.style.height = "100%";
+    app.style.height = "100%";
+    app.style.minHeight = "480px";
+  } else if (ctx.displayMode === "fullscreen") {
     app.style.height = "100vh";
   } else {
     const dims = ctx.containerDimensions ?? {};
@@ -130,7 +138,14 @@ function load(payload: Payload): void {
   closePanel();
   refresh(true);
   const focus = payload.focus ? model.byId.get(payload.focus) : null;
-  if (focus) {
+  if (focus && payload.focusDepth) {
+    // whole graph shipped with a focus: show the neighbourhood, keep "Show whole repo" local
+    setTimeout(() => {
+      focusOn(focus, payload.focusDepth);
+      select(focus, false);
+      if (view) { view.fit(true); view.autoFit = true; }
+    }, 60);
+  } else if (focus) {
     focusLabel = labelOf(focus);
     renderHeader();
     // an explore result is small: open the details and fit the whole neighbourhood beside them
@@ -469,9 +484,9 @@ function closePanel(): void {
   if (view) view.inset = { right: 0, bottom: 0 };
 }
 
-function focusOn(n: GNode): void {
+function focusOn(n: GNode, depth = 1): void {
   if (!model || !vis || !view) return;
-  vis.focus = neighbourhood(model, n, 1);
+  vis.focus = neighbourhood(model, n, depth);
   vis.expanded.add(n.fileOf?.id ?? n.id);
   for (const id of vis.focus) {
     const o = model.byId.get(id);
@@ -606,6 +621,7 @@ async function boot(): Promise<void> {
   wire();
   const injected = (window as any).__REPO_GRAPH_PAYLOAD__ as Payload | undefined;
   if (!bridge.embedded || injected) {
+    standalone = true;
     sizeToHost();
     if (injected) load(injected);
     else showMessage("Nothing to show yet", "This view opens inside Claude when the repo-graph tool runs.");

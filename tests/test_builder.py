@@ -108,8 +108,10 @@ def test_normalize_route(raw, norm):
 
 
 def test_repo_spec():
-    s = parse_repo_spec("https://github.com/rikharigaurav/Read-Code-Structure/tree/feat/mcp-server")
-    assert (s.kind, s.owner, s.name, s.ref) == ("github", "rikharigaurav", "Read-Code-Structure", "feat")
+    s = parse_repo_spec("https://github.com/rikharigaurav/Read-Code-Structure/tree/feat/mcp-server/utils")
+    assert (s.kind, s.owner, s.name) == ("github", "rikharigaurav", "Read-Code-Structure")
+    # branch names can contain slashes; fetchers try the longest real ref first
+    assert s.ref_candidates() == [("feat/mcp-server/utils", ""), ("feat/mcp-server", "utils"), ("feat", "mcp-server/utils")]
     s = parse_repo_spec("pallets/flask@3.0.0")
     assert (s.owner, s.name, s.ref) == ("pallets", "flask", "3.0.0")
     assert parse_repo_spec("git@github.com:psf/requests.git").name == "requests"

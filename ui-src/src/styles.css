@@ -111,7 +111,7 @@ button { cursor: pointer; }
 #app { display: flex; flex-direction: column; height: 600px; min-height: 0; overflow: hidden; background: var(--surface); }
 
 /* header */
-.bar { display: flex; align-items: center; gap: 16px; padding: 10px 12px 9px; border-bottom: 1px solid var(--line); }
+.bar { display: flex; align-items: center; gap: 16px; padding-block: 10px 9px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); border-bottom: 1px solid var(--line); }
 .title { min-width: 0; flex: 1; }
 .title-line { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .repo { font-size: 15px; font-weight: 650; letter-spacing: -0.01em; color: var(--ink); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -144,7 +144,7 @@ button { cursor: pointer; }
 .btn-primary:hover { background: var(--ink); opacity: 0.88; }
 .link-btn { border: 0; background: none; padding: 0; color: var(--focus); text-decoration: underline; text-underline-offset: 3px; }
 
-.scope { display: flex; align-items: center; gap: 12px; padding: 6px 12px; border-bottom: 1px solid var(--line); font-size: 12.5px; color: var(--ink-2); }
+.scope { display: flex; align-items: center; gap: 12px; padding-block: 6px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); border-bottom: 1px solid var(--line); font-size: 12.5px; color: var(--ink-2); }
 .scope[hidden] { display: none; }
 #scope-label { font-family: var(--mono); color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
@@ -177,7 +177,7 @@ button { cursor: pointer; }
 .zoom #fit { font-size: 11.5px; }
 .zoom button:hover { background: var(--map); }
 
-.status { position: absolute; left: 12px; bottom: 10px; max-width: min(62%, 520px); margin: 0; font-size: 12px; color: var(--ink-2); pointer-events: none; text-shadow: 0 0 4px var(--map), 0 0 2px var(--map); }
+.status { position: absolute; left: 16px; bottom: 10px; max-width: min(62%, 520px); margin: 0; font-size: 12px; color: var(--ink-2); pointer-events: none; text-shadow: 0 0 4px var(--map), 0 0 2px var(--map); }
 
 /* details panel */
 .panel {
@@ -210,7 +210,7 @@ button { cursor: pointer; }
 .glyph { width: 14px; height: 14px; flex: none; }
 
 /* legend */
-.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 8px 12px 9px; border-top: 1px solid var(--line); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; padding-block: 8px 9px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); border-top: 1px solid var(--line); }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip {
   display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 9px 0 7px;

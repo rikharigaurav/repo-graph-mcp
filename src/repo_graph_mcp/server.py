@@ -128,8 +128,7 @@ async def obtain_graph(repo: str, ref: str | None, path: str | None, refresh: bo
             except F.FetchError as e:
                 if "refused" in str(e) and F.shutil.which("git"):
                     log.info("GitHub API unavailable (%s); falling back to git clone", e)
-                    return await _via_git(F.RepoSpec("git", url=spec.url + ".git", ref=spec.ref, subpath=spec.subpath,
-                                                     owner=spec.owner, name=spec.name), spec, refresh, progress, t0)
+                    return await _via_git(F.as_git(spec), spec, refresh, progress, t0)
                 raise
             key = _key(spec, sha)
             if not refresh and (cached := store.get(key)):
@@ -158,6 +157,7 @@ async def _via_git(spec: F.RepoSpec, display_spec: F.RepoSpec, refresh: bool, pr
         await progress(0.15, f"Cloning {display_spec.display}")
         work = F.new_work_dir()
         co = await anyio.to_thread.run_sync(lambda: F.clone_git(spec, work))
+        display_spec.ref, display_spec.subpath = spec.ref, spec.subpath  # /tree/ link re-split by clone_git
         try:
             key = _key(display_spec, co.sha)
             if not refresh and (cached := store.get(key)):

@@ -22,7 +22,8 @@ def _fmt_counts(c: dict, order: tuple[str, ...] | None = None) -> str:
     return " · ".join(f"{k} {v}" for k, v in items)
 
 
-def summarize(g: CodeGraph, graph_id: str, elapsed_s: float, ui_shown: bool, cached: bool) -> str:
+def summarize(g: CodeGraph, graph_id: str | None, elapsed_s: float, ui_shown: bool, cached: bool) -> str:
+    """`graph_id=None` omits the MCP follow-up hint (the agent-mode CLI prints its own)."""
     s = g.stats
     labels = s.get("labels", {})
     repo = g.repo
@@ -35,8 +36,9 @@ def summarize(g: CodeGraph, graph_id: str, elapsed_s: float, ui_shown: bool, cac
     lines = [
         f"Graphed {head} @ {ref}{f' ({sha})' if sha and sha != 'local' else ''} — {s.get('nodes', 0)} nodes, "
         f"{s.get('edges', 0)} edges, {timing}.",
-        f"graph_id: {graph_id}   (pass to explore_graph / search_graph)",
     ]
+    if graph_id:
+        lines.append(f"graph_id: {graph_id}   (pass to explore_graph / search_graph)")
     if ui_shown:
         lines.append("The user can see an interactive graph of this repo in the chat now; don't redraw it — "
                      "describe or explore it instead.")

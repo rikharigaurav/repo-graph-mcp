@@ -1,12 +1,19 @@
 # repo-graph-mcp
 
-Share a repository with Claude and get its **code-structure graph back in the chat**: folders, files,
-classes, functions and API endpoints, with the calls, imports, tests and HTTP requests between them.
-You can pan, search, filter and click through it right in the conversation.
+Share a repository with Claude and get its **code-structure graph** back: folders, files, classes,
+functions and API endpoints, with the calls, imports, tests and HTTP requests between them, as an
+interactive map you can pan, search, filter and click through.
 
 It's the graph half of [Read-Code-Structure](https://github.com/rikharigaurav/Read-Code-Structure),
-packaged as a Claude plugin / MCP server. It makes no LLM summaries and no embeddings, so a typical
-repo is graphed in a second or two instead of minutes, and it needs no API keys.
+packaged as a Claude plugin. It makes no LLM summaries and no embeddings, so a typical repo is graphed in
+a second or two instead of minutes, and it needs no API keys.
+
+It runs two ways:
+- **Agent mode** (the default; works as soon as the plugin is installed). Claude runs the bundled graph
+  builder with its own tools, then shows the graph as an artifact in the Claude app, or opens it in your
+  browser from Claude Code. All you need is Python 3.10+ and git.
+- **MCP mode** (optional). A small server renders the graph inside the chat itself, as an MCP App. You
+  can run it locally or host it once for claude.ai on web and mobile.
 
 ![The graph of Read-Code-Structure rendered inside the chat](docs/graph-view.png)
 
@@ -46,7 +53,7 @@ the same database. It adds a few that are free to compute:
 | `TEST` | test file → functions and endpoints it exercises (`client.get('/users/42')` matches `/users/{id}`) |
 | `GET` · `POST` · … | client code (`fetch`, axios, requests/httpx, generated API clients) → the endpoint it hits, including through proxy prefixes like `/api` or `/api/v1` |
 
-## Tools
+## MCP tools (MCP mode)
 
 | Tool | Shown to | What it does |
 |---|---|---|
@@ -65,31 +72,70 @@ In the view you can:
 - double-click a file to show its functions, or a folder to fold or unfold it;
 - search with `/`, zoom with ctrl/⌘ + scroll (plain scroll once you've clicked into the map), and fit with `0`;
 - toggle node and link kinds in the legend;
-- use "Ask Claude about this" to send the selection back to the chat.
+- in MCP mode, use "Ask Claude about this" to send the selection back to the chat.
 
 Large repos open as an overview: functions and docs hidden, deep folders folded. The status line says what
 was folded and how to open it.
 
-## Install
+## Install the plugin (agent mode)
 
-You need [uv](https://docs.astral.sh/uv/) (or Python ≥ 3.10 and pip). Set `GITHUB_TOKEN` for private
-repos and higher GitHub rate limits; without it the server uses anonymous access and falls back to
-`git clone` when rate-limited.
-
-### Claude Code / Claude plugin
+In Claude Code:
 
 ```
 /plugin marketplace add rikharigaurav/repo-graph-mcp
 /plugin install repo-graph@repo-graph-mcp
 ```
 
-This adds the MCP server and a `graph-repo` skill. Then share a repo with Claude and ask for its graph, or
-run `/graph-repo https://github.com/owner/repo`. In a terminal you get the text summary and exploration
-tools. Apps that render MCP Apps, such as Claude on desktop and web, also show the interactive view.
+In the Claude app, add the marketplace `rikharigaurav/repo-graph-mcp` and install `repo-graph`.
+
+That's all. The plugin contains only a skill (`graph-repo`), an agent (`repo-grapher`) and the bundled
+builder, so there's no server to start. You need Python 3.10+ and git wherever Claude runs code. On first
+use the builder installs tree-sitter into a private environment in your cache folder
+(`%LOCALAPPDATA%\repo-graph` on Windows, `~/.cache/repo-graph` elsewhere), never into your global Python.
+
+### Use it
+
+Start a new chat or session after installing, then ask:
+
+- "Graph https://github.com/rikharigaurav/Read-Code-Structure", or `/graph-repo <repo>`
+- "Graph the `feat/mcp-server` branch, just the `frontend` folder"
+- "What calls `create_relation`, two levels up?"
+- "Which frontend code hits `POST /chat/`?" and "Which endpoints have no tests?"
+
+In the Claude app the graph appears as an artifact. In Claude Code it opens in your browser, and the
+files stay in the cache folder. Follow-up questions are answered from the saved graph, so they're
+instant. Private repos work whenever your own `git clone` works.
+
+You can also run the builder yourself:
+
+```bash
+python skills/graph-repo/scripts/graph_repo.py build https://github.com/owner/repo --out ./graph
+python skills/graph-repo/scripts/graph_repo.py explore ./graph "POST /chat/" --direction in --depth 2
+python skills/graph-repo/scripts/graph_repo.py search  ./graph neodb
+```
+
+## Optional: MCP mode (graph inside the chat)
+
+MCP mode needs [uv](https://docs.astral.sh/uv/), or Python ≥ 3.10 and pip. The plugin doesn't start the
+server by default. That's deliberate: a plugin that launches a program fails silently when the runtime
+is missing. Enable it in one of these ways. When the tools are present, the skill uses them automatically.
+
+Set `GITHUB_TOKEN` for private repos and higher GitHub rate limits. Without it, the server uses anonymous
+access and falls back to `git clone` when rate-limited.
+
+### Claude Code
+
+```
+claude mcp add repo-graph -- uvx --from git+https://github.com/rikharigaurav/repo-graph-mcp repo-graph-mcp
+```
+
+The same configuration is in [`mcp/repo-graph.mcp.json`](mcp/repo-graph.mcp.json) if you'd rather copy it
+into a project's `.mcp.json`.
 
 ### Claude Desktop (local server)
 
-Add to `claude_desktop_config.json`:
+Add to `claude_desktop_config.json`. On Windows, use the full path to `uvx.exe` (find it with
+`where.exe uvx`) because the app may not see your updated PATH:
 
 ```json
 {
@@ -149,9 +195,11 @@ repo's nodes.
 
 ## How it works
 
-1. **Fetch**: resolve the commit SHA (one small GitHub API call); on a cache hit, stop there. Otherwise
-   download the tarball and extract it while skipping `node_modules`, build output, VCS folders and
-   oversized files. Other git hosts use `git clone --depth 1`.
+1. **Fetch**: agent mode runs `git clone --depth 1` with your own credentials. MCP mode first resolves
+   the commit SHA (one small GitHub API call) and stops there on a cache hit; otherwise it downloads the
+   tarball and extracts it, skipping `node_modules`, build output, VCS folders and oversized files.
+   `/tree/<branch>/<folder>` links are matched against the real branch names, so branches containing
+   slashes work.
 2. **Classify**: the rules from the backend's LLM prompt, applied deterministically.
 3. **Parse**: tree-sitter for Python, JS, TS, JSX and TSX; one pass per file collects symbols, imports,
    call sites, routes and HTTP client calls.
@@ -170,6 +218,9 @@ runtime won't appear.
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 pytest -q
+
+# after changing the parser or the view, refresh the copy bundled with the skill (a test checks this)
+python tools/sync_skill_bundle.py
 
 # the in-chat view (TypeScript, bundled into one HTML file inside the Python package)
 cd ui-src && npm ci && npm run build      # writes src/repo_graph_mcp/ui/graph-view.html

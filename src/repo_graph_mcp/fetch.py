@@ -9,6 +9,7 @@ cache without downloading anything.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import re
@@ -18,10 +19,12 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-
-import httpx
+from typing import TYPE_CHECKING
 
 from .classify import is_ignored_dir
+
+if TYPE_CHECKING:  # httpx is only needed by the MCP server's tarball path, not by the agent-mode CLI
+    import httpx
 
 log = logging.getLogger("repo_graph_mcp")
 
@@ -50,6 +53,14 @@ class RepoSpec:
     subpath: str = ""
     url: str = ""
     local_path: str = ""
+    tree_link: bool = False  # ref/subpath came from a /tree/<a>/<b>/<c> link and may need re-splitting
+
+    def ref_candidates(self) -> list[tuple[str, str]]:
+        """For /tree/feat/mcp-server/src: ('feat/mcp-server/src',''), ('feat/mcp-server','src'), ('feat','mcp-server/src')."""
+        if not self.tree_link or not self.ref:
+            return [(self.ref or "", self.subpath)]
+        parts = [self.ref, *[p for p in self.subpath.split("/") if p]]
+        return [("/".join(parts[:i]), "/".join(parts[i:])) for i in range(len(parts), 0, -1)]
 
     @property
     def display(self) -> str:
@@ -89,10 +100,12 @@ def parse_repo_spec(repo: str, ref: str | None = None, subpath: str | None = Non
             spec = RepoSpec(kind="github", owner=gd["owner"], name=gd["repo"], ref=ref or gd.get("ref"))
             rest = gd.get("rest")
             if rest and not ref:
-                # /tree/<branch>/<sub/path> — branch names with slashes are ambiguous; take the first segment
+                # /tree/<branch>/<sub/path>: branch names may contain slashes, so the split is
+                # provisional; fetchers try ref_candidates() against the real branch/tag list
                 head, _, tail = rest.partition("/")
                 spec.ref = head
                 spec.subpath = tail
+                spec.tree_link = bool(tail)
             spec.subpath = subpath or spec.subpath
             spec.url = f"https://github.com/{spec.owner}/{spec.name}"
             return spec
@@ -120,12 +133,41 @@ async def resolve_github_sha(spec: RepoSpec, client: httpx.AsyncClient) -> tuple
         r = await client.get(f"{GITHUB_API}/repos/{spec.owner}/{spec.name}", headers=_gh_headers())
         _raise_for_github(r, spec)
         ref = r.json().get("default_branch") or "HEAD"
-    r = await client.get(
-        f"{GITHUB_API}/repos/{spec.owner}/{spec.name}/commits/{ref}",
-        headers={**_gh_headers(), "Accept": "application/vnd.github.sha"},
-    )
-    _raise_for_github(r, spec, ref)
-    return r.text.strip(), ref
+    candidates = spec.ref_candidates() if spec.ref else [(ref, spec.subpath)]
+    for i, (cand, sub) in enumerate(candidates):
+        r = await client.get(
+            f"{GITHUB_API}/repos/{spec.owner}/{spec.name}/commits/{cand}",
+            headers={**_gh_headers(), "Accept": "application/vnd.github.sha"},
+        )
+        if r.status_code in (404, 422) and i < len(candidates) - 1:
+            continue  # not a ref; try a shorter branch name
+        _raise_for_github(r, spec, cand)
+        spec.ref, spec.subpath, spec.tree_link = cand, sub, False
+        return r.text.strip(), cand
+    raise FetchError(f"No branch or tag of {spec.display} matches '{spec.ref}'.")
+
+
+def as_git(spec: RepoSpec) -> RepoSpec:
+    """The same GitHub repo, fetched with `git clone` (uses the caller's own git credentials)."""
+    return dataclasses.replace(spec, kind="git", url=spec.url + ".git")
+
+
+def resolve_tree_ref_git(spec: RepoSpec) -> None:
+    """Re-split an ambiguous /tree/ link using the remote's real branch and tag names."""
+    if not spec.tree_link:
+        return
+    p = subprocess.run(["git", "ls-remote", "--heads", "--tags", spec.url], capture_output=True, text=True,
+                       timeout=60, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    names = set()
+    for line in p.stdout.splitlines():
+        ref = line.split("\t")[-1]
+        for prefix in ("refs/heads/", "refs/tags/"):
+            if ref.startswith(prefix):
+                names.add(ref[len(prefix):].removesuffix("^{}"))
+    for cand, sub in spec.ref_candidates():
+        if cand in names:
+            spec.ref, spec.subpath, spec.tree_link = cand, sub, False
+            return
 
 
 def _raise_for_github(r: httpx.Response, spec: RepoSpec, ref: str | None = None) -> None:
@@ -205,6 +247,7 @@ def _safe_extract(tar_path: Path, dest: Path, subpath: str = "") -> int:
 def clone_git(spec: RepoSpec, work_dir: Path) -> Checkout:
     if not shutil.which("git"):
         raise FetchError("git is not installed on the MCP server, so only GitHub repos and local paths work.")
+    resolve_tree_ref_git(spec)
     dest = work_dir / "src"
     cmd = ["git", "clone", "--depth", "1", "--single-branch", "--no-tags"]
     if spec.ref:

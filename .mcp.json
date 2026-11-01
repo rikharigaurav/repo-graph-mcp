@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "repo-graph": {
-      "command": "uvx",
-      "args": ["--from", "${CLAUDE_PLUGIN_ROOT}", "repo-graph-mcp"]
-    }
-  }
-}

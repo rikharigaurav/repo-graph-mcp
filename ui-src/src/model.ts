@@ -68,6 +68,8 @@ export interface Payload {
   totalNodes?: number;
   totalEdges?: number;
   focus?: string | null;
+  /** Agent mode: the payload is the whole graph; filter the view to this many hops around `focus`. */
+  focusDepth?: number;
   graphId: string;
   mode?: "repo" | "explore";
   error?: string;
