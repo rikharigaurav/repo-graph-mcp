@@ -12,6 +12,7 @@
   --halo: #eef2f4;
   --focus: #2e6bd9;
   --select: #1c2127;
+  --on-kind: #ffffff;
 
   --region-fill: rgba(70, 96, 120, 0.075);
   --region-stroke: rgba(70, 96, 120, 0.24);
@@ -49,6 +50,7 @@
     --halo: #191d22;
     --focus: #6e9eff;
     --select: #e7ebef;
+    --on-kind: #0f1418;
     --region-fill: rgba(150, 178, 205, 0.07);
     --region-stroke: rgba(150, 178, 205, 0.22);
     --region-label: #a5b7c9;
@@ -81,6 +83,7 @@
   --halo: #191d22;
   --focus: #6e9eff;
   --select: #e7ebef;
+  --on-kind: #0f1418;
   --region-fill: rgba(150, 178, 205, 0.07);
   --region-stroke: rgba(150, 178, 205, 0.22);
   --region-label: #a5b7c9;
@@ -207,7 +210,7 @@ button { cursor: pointer; }
 .rel-path { margin-left: auto; padding-left: 8px; font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; flex-shrink: 1; }
 .rel-more { padding: 4px 0; font-size: 12px; color: var(--ink-3); }
 .panel-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 16px; }
-.glyph { width: 14px; height: 14px; flex: none; }
+.glyph { width: 16px; height: 16px; flex: none; }
 
 /* legend */
 .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; padding-block: 8px 9px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); border-top: 1px solid var(--line); }

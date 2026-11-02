@@ -6,7 +6,7 @@ description: >
   architecture", "how is this repo organised", "what calls X", "which tests cover Y", "where is endpoint Z
   handled", or invokes /graph-repo. It builds a structural graph of the code and shows it interactively.
 metadata:
-  version: "0.2.0"
+  version: "0.2.1"
 ---
 
 # Graph a repository

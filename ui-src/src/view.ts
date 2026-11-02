@@ -2,13 +2,14 @@ import {
   forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY,
   type Simulation,
 } from "d3-force";
+import { cornerPath, flapPath, fontWithSize, halfWidth, iconPath, markFor } from "./icons";
 import { KIND, type GNode, type Group, type Kind, type VLink } from "./model";
 
 interface Palette {
   kind: Record<Kind, string>;
   edge: Record<Group, string>;
   ink: string; ink2: string; ink3: string; map: string; halo: string;
-  regionFill: string; regionStroke: string; regionLabel: string; select: string;
+  regionFill: string; regionStroke: string; regionLabel: string; select: string; onKind: string;
 }
 
 const SHAPE_ORDER: Kind[] = ["Folder", "DocumentationFile", "TemplateMarkupFile", "TestingFile", "DataFile", "Class", "ApiEndpoint", "Function"];
@@ -96,7 +97,7 @@ export class GraphView {
         .strength((d) => -(18 + d.r * (big ? 4 : 7)) * (d.kind === "Folder" ? 2.2 : 1))
         .distanceMax(big ? 260 : 420)
         .theta(big ? 1.1 : 0.9))
-      .force("collide", forceCollide<GNode>((d) => d.r + 2.5).iterations(1))
+      .force("collide", forceCollide<GNode>((d) => hw(d) + 2.5).iterations(1))
       .force("territory", territoryForce(0.06))
       .force("x", forceX<GNode>(0).strength(0.035))
       .force("y", forceY<GNode>(0).strength(0.045));
@@ -135,7 +136,7 @@ export class GraphView {
       },
       ink: v("--ink"), ink2: v("--ink-2"), ink3: v("--ink-3"), map: v("--map"), halo: v("--halo"),
       regionFill: v("--region-fill"), regionStroke: v("--region-stroke"), regionLabel: v("--region-label"),
-      select: v("--select"),
+      select: v("--select"), onKind: v("--on-kind"),
     };
     this.invalidate();
   }
@@ -223,7 +224,7 @@ export class GraphView {
     const slop = 5 / this.k;
     for (const n of this.nodes) {
       const dx = n.x! - x, dy = n.y! - y;
-      const d = Math.sqrt(dx * dx + dy * dy) - n.r;
+      const d = Math.sqrt(dx * dx + dy * dy) - hw(n);
       if (d < slop && d < bestD) { best = n; bestD = d; }
     }
     return best;
@@ -405,7 +406,7 @@ export class GraphView {
     if (this.selected) {
       const n = this.selected;
       ctx.beginPath();
-      ctx.arc(n.x!, n.y!, Math.max(0.5, n.r + 4 / k), 0, Math.PI * 2);
+      ctx.arc(n.x!, n.y!, Math.max(0.5, hw(n) * 1.08 + 4 / k), 0, Math.PI * 2);
       ctx.strokeStyle = pal.select;
       ctx.lineWidth = 2 / k;
       ctx.stroke();
@@ -446,43 +447,46 @@ export class GraphView {
   private fillShapes(ns: GNode[], kind: Kind, alpha: number): void {
     const { ctx, k, pal } = this;
     const color = pal.kind[kind];
-    ctx.globalAlpha = alpha;
     const shape = KIND[kind].shape;
-    if (shape === "ring") {
-      ctx.fillStyle = pal.map;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = Math.max(1.4 / k, 1.6);
-      ctx.beginPath();
-      for (const n of ns) { ctx.moveTo(n.x! + n.r, n.y!); ctx.arc(n.x!, n.y!, Math.max(0.5, n.r), 0, Math.PI * 2); }
-      ctx.fill();
-      ctx.stroke();
-      // folded folders get a filled centre: there is more inside
-      const folded = ns.filter((n) => this.collapsed.has(n.id));
-      if (folded.length) {
-        ctx.fillStyle = color;
-        ctx.beginPath();
-        for (const n of folded) { ctx.moveTo(n.x! + n.r * 0.5, n.y!); ctx.arc(n.x!, n.y!, Math.max(0.5, n.r * 0.5), 0, Math.PI * 2); }
-        ctx.fill();
-      }
-      ctx.globalAlpha = 1;
-      return;
-    }
+    ctx.globalAlpha = alpha;
     const external = kind === "ApiEndpoint" ? ns.filter((n) => n.props.defined_in_repo === false) : [];
     const solid = external.length ? ns.filter((n) => n.props.defined_in_repo !== false) : ns;
     ctx.fillStyle = color;
     ctx.beginPath();
-    for (const n of solid) shapePath(ctx, shape, n.x!, n.y!, n.r);
+    for (const n of solid) iconPath(ctx, shape, n.x!, n.y!, n.r);
     ctx.fill();
+    if ((shape === "file" || shape === "folder") && k * 5 > 3) {
+      // a lighter turned corner on pages, a lighter front flap on folders
+      ctx.globalAlpha = alpha * (shape === "file" ? 0.45 : 0.2);
+      ctx.fillStyle = pal.onKind;
+      ctx.beginPath();
+      for (const n of solid) (shape === "file" ? cornerPath : flapPath)(ctx, n.x!, n.y!, n.r);
+      ctx.fill();
+      ctx.globalAlpha = alpha;
+    }
     if (external.length) {
       ctx.fillStyle = pal.map;
       ctx.strokeStyle = color;
       ctx.lineWidth = 1.4 / k;
       ctx.setLineDash([2 / k, 1.6 / k]);
       ctx.beginPath();
-      for (const n of external) shapePath(ctx, shape, n.x!, n.y!, n.r);
+      for (const n of external) iconPath(ctx, shape, n.x!, n.y!, n.r);
       ctx.fill();
       ctx.stroke();
       ctx.setLineDash([]);
+    }
+    // marks inside the icons (extension, ƒ, C, +) once they're big enough to read
+    ctx.fillStyle = pal.onKind;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const mono = getMono(), sans = getSans();
+    let lastFont = "";
+    for (const n of solid) {
+      const m = markFor(n, shape, this.collapsed.has(n.id), mono, sans);
+      if (!m || m.size * k < 6.5) continue;
+      const font = fontWithSize(m, m.size);
+      if (font !== lastFont) { ctx.font = font; lastFont = font; }
+      ctx.fillText(m.text, n.x!, n.y! + m.dy);
     }
     ctx.globalAlpha = 1;
   }
@@ -576,7 +580,7 @@ export class GraphView {
       const isLit = this.lit.has(n);
       let show = isLit;
       if (!show && !dim) {
-        if (n.kind === "Folder") show = k > 0.45 && n.depth > (this.regionLabels.length ? 1 : 0);
+        if (n.kind === "Folder") show = (k > 0.45 && n.depth > (this.regionLabels.length ? 1 : 0)) || k > 1.2;
         else if (n.kind === "ApiEndpoint") show = k > 0.5;
         else if (n.kind === "Function") show = k > 1.9 || (k > 1.1 && n.deg > 4);
         else show = k > 1.05 || (k > 0.6 && sr > 5);
@@ -594,7 +598,7 @@ export class GraphView {
       const isCode = n.kind === "Function" || n.kind === "Class" || n.kind === "ApiEndpoint";
       ctx.font = `${strong || n.kind === "Folder" ? 600 : 450} ${size}px ${isCode ? getMono() : font}`;
       const label = labelFor(n);
-      const sx = n.x! * k + this.tx + n.r * k + 4;
+      const sx = n.x! * k + this.tx + hw(n) * k + 5;
       const sy = n.y! * k + this.ty;
       if (sx > this.w + 10 || sy < -10 || sy > this.h + 10 || sx < -200) continue;
       const w = ctx.measureText(label).width;
@@ -607,6 +611,14 @@ export class GraphView {
       drawn++;
     }
   }
+}
+
+const hw = (n: GNode) => halfWidth(KIND[n.kind].shape, n.r);
+
+let sansCache = "";
+function getSans(): string {
+  if (!sansCache) sansCache = getComputedStyle(document.documentElement).getPropertyValue("--font").trim() || "system-ui";
+  return sansCache;
 }
 
 let monoCache = "";
@@ -659,47 +671,13 @@ function arrowHead(ctx: CanvasRenderingContext2D, l: VLink, k: number): void {
   const s = l.source, t = l.target;
   const [cx, cy] = bend(s, t);
   const ang = Math.atan2(t.y! - cy, t.x! - cx);
-  const tipX = t.x! - Math.cos(ang) * (t.r + 1.5 / k);
-  const tipY = t.y! - Math.sin(ang) * (t.r + 1.5 / k);
+  const tipX = t.x! - Math.cos(ang) * (hw(t) * 0.92 + 1.5 / k);
+  const tipY = t.y! - Math.sin(ang) * (hw(t) * 0.92 + 1.5 / k);
   const len = 6 / k, wid = 3 / k;
   ctx.moveTo(tipX, tipY);
   ctx.lineTo(tipX - Math.cos(ang) * len - Math.sin(ang) * wid, tipY - Math.sin(ang) * len + Math.cos(ang) * wid);
   ctx.lineTo(tipX - Math.cos(ang) * len + Math.sin(ang) * wid, tipY - Math.sin(ang) * len - Math.cos(ang) * wid);
   ctx.closePath();
-}
-
-export function shapePath(ctx: CanvasRenderingContext2D | Path2D, shape: string, x: number, y: number, r: number): void {
-  switch (shape) {
-    case "square": {
-      const s = r * 0.9, c = r * 0.3;
-      ctx.moveTo(x - s + c, y - s);
-      ctx.arcTo(x + s, y - s, x + s, y + s, c);
-      ctx.arcTo(x + s, y + s, x - s, y + s, c);
-      ctx.arcTo(x - s, y + s, x - s, y - s, c);
-      ctx.arcTo(x - s, y - s, x + s, y - s, c);
-      ctx.closePath();
-      break;
-    }
-    case "diamond":
-      ctx.moveTo(x, y - r * 1.15);
-      ctx.lineTo(x + r * 1.15, y);
-      ctx.lineTo(x, y + r * 1.15);
-      ctx.lineTo(x - r * 1.15, y);
-      ctx.closePath();
-      break;
-    case "hex":
-      for (let i = 0; i < 6; i++) {
-        const a = Math.PI / 6 + (i * Math.PI) / 3;
-        const px = x + Math.cos(a) * r * 1.1, py = y + Math.sin(a) * r * 1.1;
-        if (i === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
-      }
-      ctx.closePath();
-      break;
-    default:
-      ctx.moveTo(x + r, y);
-      ctx.arc(x, y, Math.max(0.5, r), 0, Math.PI * 2);
-  }
 }
 
 /** Pull each node toward the centroid of its top-level folder so territories stay compact and

@@ -3,7 +3,8 @@ import {
   KINDS, KIND, LINK_GROUPS, Model, SINGULAR, computeVisible, isFile, neighbourhood, relPhrase,
   type GNode, type Group, type Kind, type Payload, type VisState,
 } from "./model";
-import { GraphView, shapePath } from "./view";
+import { drawGlyph } from "./icons";
+import { GraphView } from "./view";
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
 const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string) => {
@@ -265,16 +266,14 @@ function renderStatus(visibleCount: number): void {
 
 // ── legend / filters ──────────────────────────────────────────────────────
 function glyph(kind: Kind): HTMLCanvasElement {
+  const size = 16;
   const c = el("canvas", "glyph");
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  c.width = c.height = 14 * dpr;
+  c.width = c.height = size * dpr;
   const ctx = c.getContext("2d")!;
   ctx.scale(dpr, dpr);
-  const color = getComputedStyle(document.documentElement).getPropertyValue(KIND[kind].color).trim();
-  ctx.beginPath();
-  shapePath(ctx, KIND[kind].shape === "ring" ? "dot" : KIND[kind].shape, 7, 7, KIND[kind].shape === "dot" ? 3.6 : 4.6);
-  if (KIND[kind].shape === "ring") { ctx.lineWidth = 1.8; ctx.strokeStyle = color; ctx.stroke(); }
-  else { ctx.fillStyle = color; ctx.fill(); }
+  const cs = getComputedStyle(document.documentElement);
+  drawGlyph(ctx, KIND[kind].shape, size, cs.getPropertyValue(KIND[kind].color).trim(), cs.getPropertyValue("--on-kind").trim());
   return c;
 }
 

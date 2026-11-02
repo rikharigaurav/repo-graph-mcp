@@ -3,14 +3,14 @@ import type { SimulationNodeDatum } from "d3-force";
 export type Kind =
   | "Folder" | "DataFile" | "TestingFile" | "DocumentationFile" | "TemplateMarkupFile"
   | "Class" | "Function" | "ApiEndpoint";
-export type Shape = "ring" | "square" | "diamond" | "dot" | "hex";
+export type Shape = "folder" | "file" | "diamond" | "dot" | "hex";
 
 export const KINDS: { key: Kind; name: string; shape: Shape; color: string }[] = [
-  { key: "Folder", name: "Folders", shape: "ring", color: "--k-folder" },
-  { key: "DataFile", name: "Source files", shape: "square", color: "--k-source" },
-  { key: "TestingFile", name: "Tests", shape: "square", color: "--k-test" },
-  { key: "DocumentationFile", name: "Docs", shape: "square", color: "--k-doc" },
-  { key: "TemplateMarkupFile", name: "Templates", shape: "square", color: "--k-template" },
+  { key: "Folder", name: "Folders", shape: "folder", color: "--k-folder" },
+  { key: "DataFile", name: "Source files", shape: "file", color: "--k-source" },
+  { key: "TestingFile", name: "Tests", shape: "file", color: "--k-test" },
+  { key: "DocumentationFile", name: "Docs", shape: "file", color: "--k-doc" },
+  { key: "TemplateMarkupFile", name: "Templates", shape: "file", color: "--k-template" },
   { key: "Class", name: "Classes", shape: "diamond", color: "--k-class" },
   { key: "Function", name: "Functions", shape: "dot", color: "--k-function" },
   { key: "ApiEndpoint", name: "Endpoints", shape: "hex", color: "--k-endpoint" },
@@ -169,9 +169,9 @@ function radius(n: GNode): number {
     case "Class":
       return Math.min(8, 4.5 + Math.sqrt(n.children.length) * 0.6);
     case "Function":
-      return Math.min(6.5, 2.8 + Math.sqrt(n.deg) * 0.7);
+      return Math.min(7, 3.3 + Math.sqrt(n.deg) * 0.7);
     default:
-      return Math.min(9, 4 + Math.sqrt(n.children.length) * 0.7);
+      return Math.min(9.5, 5 + Math.sqrt(n.children.length) * 0.6);
   }
 }
 
