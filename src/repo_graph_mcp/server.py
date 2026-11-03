@@ -54,6 +54,11 @@ Tools for turning a code repository into a structural graph and showing it in th
 - To zoom in on one file, function, class or endpoint (callers, callees, imports, tests), call
   `explore_graph` — it shows a focused view of that neighbourhood.
 - To find symbols by name before exploring, call `search_graph`.
+- The graph also has a GenAI & services layer: AI agents (LangGraph graphs and their steps, prebuilt and
+  framework agents, their tools), MCP servers and what they expose, external services the code uses
+  (LLM providers, vector/graph DBs, databases, queues, cloud SDKs, known APIs) and env vars it reads. Ask
+  `explore_graph` about an agent, a service (direction 'in' = the code that uses it) or an env var; each
+  link cites the file:line it was found on. Infrastructure files and cloud-console settings aren't read.
 - Graphs are cached per commit, so calling again for the same repo is instant.
 Only Python and JavaScript/TypeScript are parsed into functions/classes/calls; other languages appear as
 files. Links are resolved statically, so dynamic dispatch and reflection are not followed.
@@ -210,9 +215,12 @@ async def graph_repo(
     """Parse a code repository into a structure graph and show it to the user as an interactive view.
 
     Nodes: Folder, DataFile (source), TestingFile, DocumentationFile, TemplateMarkupFile, Class, Function,
-    ApiEndpoint. Edges: BELONGS_TO (containment), IMPORTS, CALLS, EXTENDS, TEST, and GET/POST/... from
-    HTTP client calls to the endpoints they hit. Returns a text summary (layout, endpoints, hubs) and a
-    graph_id for explore_graph / search_graph. Takes seconds — there are no LLM or embedding calls.
+    ApiEndpoint, plus the GenAI layer: Agent, AgentStep, McpServer, ExternalService, EnvVar. Edges:
+    BELONGS_TO (containment), IMPORTS, CALLS, EXTENDS, TEST, GET/POST/... from HTTP client calls to the
+    endpoints they hit, and NEXT / RUNS / ROUTES / USES_TOOL (agent flow and what steps run), EXPOSES (MCP
+    server -> tool), USES (code -> service), READS_ENV (code -> env var). Returns a text summary (layout,
+    endpoints, agents, services, env vars, hubs) and a graph_id for explore_graph / search_graph. Takes
+    seconds — there are no LLM or embedding calls.
     """
     try:
         key, g, secs, cached = await obtain_graph(repo, ref, path, refresh, ctx)
@@ -237,7 +245,8 @@ async def explore_graph(
                                                                          "'out' = what it uses.")] = "both",
 ) -> CallToolResult:
     """Show the neighbourhood of one node — e.g. everything that calls a function, what a file imports,
-    which tests cover an endpoint — as a focused interactive view, with a text description."""
+    which tests cover an endpoint, an agent's steps and the functions they run, the code that uses a
+    service or reads an env var — as a focused interactive view, with a text description."""
     try:
         key, g = await find_graph(graph, ctx)
     except (F.FetchError, httpx.HTTPError) as e:
@@ -300,7 +309,8 @@ async def search_graph(
     graph: Annotated[str, Field(description="graph_id from graph_repo, or the repo (URL / owner/repo).")],
     query: Annotated[str, Field(description="Name, path fragment or docstring words to look for.")],
     label: Annotated[str | None, Field(description="Restrict to one node label: Function, Class, ApiEndpoint, "
-                                                   "DataFile, TestingFile, Folder, DocumentationFile, TemplateMarkupFile.")] = None,
+                                                   "DataFile, TestingFile, Folder, DocumentationFile, TemplateMarkupFile, "
+                                                   "Agent, AgentStep, McpServer, ExternalService, EnvVar.")] = None,
     limit: Annotated[int, Field(ge=1, le=100)] = 20,
 ) -> str:
     """Find nodes in a repo graph by name/path. Returns ids you can pass to explore_graph."""

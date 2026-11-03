@@ -4,16 +4,20 @@ description: >
   This skill should be used when the user shares a code repository (a GitHub URL, "owner/repo", a git URL
   or a local folder) and asks to "graph this repo", "map the codebase", "show the structure", "visualize the
   architecture", "how is this repo organised", "what calls X", "which tests cover Y", "where is endpoint Z
-  handled", or invokes /graph-repo. It builds a structural graph of the code and shows it interactively.
+  handled", "what does the agent do", "which code uses the LLM / vector DB", "what env vars does it need",
+  or invokes /graph-repo. It builds a structural graph of the code, including its AI agents, MCP servers,
+  external services and env vars, and shows it interactively.
 metadata:
-  version: "0.2.1"
+  version: "0.3.0"
 ---
 
 # Graph a repository
 
 Turn a repository into a code-structure graph (folders, files, classes, functions, API endpoints and the
-calls, imports, tests and HTTP requests between them) and show it as an interactive view. Parsing uses
-tree-sitter: no LLM summaries, no embeddings, so a typical repo takes seconds.
+calls, imports, tests and HTTP requests between them) and show it as an interactive view. A GenAI &
+services layer sits beside the code: AI agents with their steps and tools, MCP servers, the services the
+code calls (LLMs, vector/graph DBs, databases, queues, cloud SDKs) and the env vars it reads. Parsing is
+static: no LLM summaries, no embeddings, so a typical repo takes seconds.
 
 There are two ways to run it. Pick the first that is available.
 
@@ -54,19 +58,23 @@ the user's cache folder (never into their global Python); later runs start immed
      `open "<path>"` on macOS, `xdg-open "<path>"` on Linux. Tell the user the file path too.
 
 4. **Orient the user.** Reply briefly, drawing on the printed summary: the main areas (top-level folders),
-   the API endpoints and who calls them, the most-called functions and most-imported files, and anything
-   notable, such as frontend calls that hit backend routes or code with no tests.
+   the API endpoints and who calls them, the AI agents and their flow, the services it depends on, the
+   most-called functions and most-imported files, and anything notable, such as frontend calls that hit
+   backend routes, code with no tests, or a `Warning:` line about a secret exposed to the browser (always
+   mention those).
 
 5. **Follow-ups** use the saved graph, so they are instant and need no network:
 
    ```
    PY "<skill dir>/scripts/graph_repo.py" explore <out dir> "<node>" [--direction in|out|both] [--depth 1-4] [--relations CALLS,IMPORTS]
-   PY "<skill dir>/scripts/graph_repo.py" search  <out dir> "<query>" [--label Function|Class|ApiEndpoint|DataFile|TestingFile|Folder]
+   PY "<skill dir>/scripts/graph_repo.py" search  <out dir> "<query>" [--label Function|Class|ApiEndpoint|Agent|ExternalService|EnvVar|…]
    ```
 
    `<node>` can be a function or method (`create_relation`, `App.create_relation`), a file path, a folder,
-   a route handler name, or an endpoint (`"POST /chat/"`). `--direction in` lists callers and importers,
-   `out` lists dependencies. `explore` prints the node's relationships and writes `explore-<node>.html`
+   a route handler name, an endpoint (`"POST /chat/"`), an agent, a service (`Pinecone`) or an env var.
+   `--direction in` lists callers and importers (for a service: the code that uses it; for an env var:
+   where it's read), `out` lists dependencies. Exploring an agent prints its steps in order with the
+   function each runs and where it goes next; its view opens already broken down. `explore` prints the node's relationships and writes `explore-<node>.html`
    (and `explore-<node>-artifact.html`): the whole graph, opened on that neighbourhood. Show it the
    same way as step 3 when the user wants to see it.
    If `explore` says nothing matched, run `search` and retry with the returned id.
@@ -79,10 +87,20 @@ the user's cache folder (never into their global Python); later runs start immed
   a function or endpoint) and `GET`/`POST`/… (client code requesting an endpoint, either exactly or
   through a proxy prefix such as `/api`).
 - Endpoints marked "called but not defined here" are requests to routes outside the repository.
+- GenAI layer labels: `Agent`, `AgentStep`, `McpServer`, `ExternalService`, `EnvVar`, under one `GenAI`
+  hub. Relationships: `NEXT` (step → step; `kind` edge, conditional or goto), `RUNS` (step → function or
+  sub-agent), `ROUTES` (step → router function), `USES_TOOL`, `EXPOSES` (MCP server → tool), `USES`
+  (code → service), `READS_ENV` (code → env var). Every such link cites `file:line`; `inferred` ones
+  follow a client object rather than a direct SDK call, so say so when it matters. Env vars are
+  `required` (fails when unset), have a default, or are optional.
+- The layer sees only code. Anything configured outside the repo (cloud console, deployed env, infra
+  files) isn't in it, and docs/examples/tests/migrations aren't scanned: say "not declared in the code"
+  rather than "not used".
 - Only Python and JavaScript/TypeScript are parsed into symbols; other languages appear as files. Calls
   are resolved statically, so say so when the user asks about dynamic dispatch, plugins or reflection.
 - In the view: click a node for details, double-click a file to show its functions or a folder to
-  fold/unfold it, press `/` to search, toggle kinds in the legend. Large repos open as an overview.
+  fold/unfold it, double-click an agent, service, MCP server or env var to break it down into the code
+  behind it, press `/` to search, toggle kinds in the legend. Large repos open as an overview.
 
 ## When something fails
 

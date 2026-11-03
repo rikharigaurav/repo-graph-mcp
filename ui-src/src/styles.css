@@ -34,6 +34,20 @@
   --e-tests: #23935a;
   --e-extends: #b3418b;
 
+  /* GenAI layer */
+  --k-ai: #6d3fd1;
+  --k-agent: #7341d6;
+  --k-step: #9468e3;
+  --k-mcp: #3d55c4;
+  --k-service: #a65f1c;
+  --k-env: #5f8410;
+  --e-flow: #7341d6;
+  --e-runs: #9468e3;
+  --e-uses: #a65f1c;
+  --e-env: #5f8410;
+  --warn: #d0342c;
+  --warn-bg: rgba(208, 52, 44, 0.08);
+
   --radius: var(--border-radius-md, 8px);
   color-scheme: light;
 }
@@ -68,6 +82,18 @@
     --e-http: #ff7b57;
     --e-tests: #4cc485;
     --e-extends: #e57cc0;
+    --k-ai: #a98bff;
+    --k-agent: #a98bff;
+    --k-step: #c2a8ff;
+    --k-mcp: #8a9dff;
+    --k-service: #e39a55;
+    --k-env: #a8d24a;
+    --e-flow: #a98bff;
+    --e-runs: #c2a8ff;
+    --e-uses: #e39a55;
+    --e-env: #a8d24a;
+    --warn: #ff6b61;
+    --warn-bg: rgba(255, 107, 97, 0.12);
     color-scheme: dark;
   }
 }
@@ -101,6 +127,18 @@
   --e-http: #ff7b57;
   --e-tests: #4cc485;
   --e-extends: #e57cc0;
+  --k-ai: #a98bff;
+  --k-agent: #a98bff;
+  --k-step: #c2a8ff;
+  --k-mcp: #8a9dff;
+  --k-service: #e39a55;
+  --k-env: #a8d24a;
+  --e-flow: #a98bff;
+  --e-runs: #c2a8ff;
+  --e-uses: #e39a55;
+  --e-env: #a8d24a;
+  --warn: #ff6b61;
+  --warn-bg: rgba(255, 107, 97, 0.12);
   color-scheme: dark;
 }
 
@@ -246,3 +284,15 @@ button { cursor: pointer; }
 @media (prefers-reduced-motion: reduce) {
   .progress::after { animation: none; width: 100%; opacity: 0.5; }
 }
+
+/* GenAI layer details */
+.panel-warn { margin: 0 0 10px; padding: 8px 10px; border-radius: var(--radius); background: var(--warn-bg); color: var(--warn); font-size: 12.5px; }
+.panel-note { margin: 0; font-size: 12px; color: var(--ink-3); }
+.flow-list { list-style: none; margin: 0; padding: 0; }
+.flow-step { margin: 0 0 4px; }
+.flow-note { margin: -2px 0 0 23px; font-size: 11.5px; color: var(--ink-3); }
+.flow-badge { margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 10.5px; line-height: 16px; color: var(--k-agent); border: 1px solid currentColor; }
+.swatch-flow { border-color: var(--e-flow); border-top-width: 3px; }
+.swatch-runs { border-color: var(--e-runs); border-top-style: dashed; }
+.swatch-uses { border-color: var(--e-uses); }
+.swatch-env { border-color: var(--e-env); border-top-style: dotted; }

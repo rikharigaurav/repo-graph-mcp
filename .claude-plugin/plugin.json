@@ -1,11 +1,11 @@
 {
   "name": "repo-graph",
-  "version": "0.2.1",
-  "description": "Share a repo with Claude and get its code-structure graph (folders, files, classes, functions, API endpoints, calls, imports, tests) as an interactive view. Works on install with no server: Claude runs the bundled graph builder itself. Graph only, no LLM summaries or embeddings, so it takes seconds.",
+  "version": "0.3.0",
+  "description": "Share a repo with Claude and get its code-structure graph (folders, files, classes, functions, API endpoints, calls, imports, tests) plus its AI agents, MCP servers, services and env vars as an interactive view. Works on install with no server: Claude runs the bundled graph builder itself. Graph only, no LLM summaries or embeddings, so it takes seconds.",
   "author": {
     "name": "rikharigaurav"
   },
   "repository": "https://github.com/rikharigaurav/repo-graph-mcp",
   "license": "MIT",
-  "keywords": ["mcp", "mcp-apps", "code-graph", "repository", "architecture", "tree-sitter", "neo4j"]
+  "keywords": ["mcp", "mcp-apps", "code-graph", "repository", "architecture", "tree-sitter", "neo4j", "langgraph", "ai-agents"]
 }

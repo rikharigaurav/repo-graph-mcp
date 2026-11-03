@@ -2,7 +2,9 @@
 
 Share a repository with Claude and get its **code-structure graph** back: folders, files, classes,
 functions and API endpoints, with the calls, imports, tests and HTTP requests between them, as an
-interactive map you can pan, search, filter and click through.
+interactive map you can pan, search, filter and click through. A **GenAI & services** layer sits beside
+the code: the AI agents in it (and their steps and tools), MCP servers, the LLMs, vector/graph databases
+and other services it calls, and the env vars it reads, each linked to the functions behind it.
 
 It's the graph half of [Read-Code-Structure](https://github.com/rikharigaurav/Read-Code-Structure),
 packaged as a Claude plugin. It makes no LLM summaries and no embeddings, so a typical repo is graphed in
@@ -53,6 +55,36 @@ the same database. It adds a few that are free to compute:
 | `TEST` | test file → functions and endpoints it exercises (`client.get('/users/42')` matches `/users/{id}`) |
 | `GET` · `POST` · … | client code (`fetch`, axios, requests/httpx, generated API clients) → the endpoint it hits, including through proxy prefixes like `/api` or `/api/v1` |
 
+### GenAI & services layer
+
+![Double-clicking an agent breaks it down into its numbered steps and the functions they run](docs/graph-view-genai.png)
+
+Found by the same static pass (Python via `ast`, JS/TS via the parse plus targeted patterns) and grouped
+under one `GenAI` hub node, so the view shows it as its own territory. Every link records the `file`
+and `line` it came from and a `basis`: `declared` when the code says it outright, `inferred` when it
+follows a value (a call on an object built from an SDK client).
+
+| Nodes | |
+|---|---|
+| `Agent` | LangGraph `StateGraph` / `MessageGraph` (Python and LangGraph.js), prebuilt agents (`create_react_agent`, `create_supervisor`, `create_deep_agent`, `AgentExecutor`…) and framework agents (`Agent(...)` from the OpenAI Agents SDK, PydanticAI, CrewAI, smolagents, AutoGen, Google ADK, LlamaIndex…) |
+| `AgentStep` | one node of an agent's graph, numbered in the order it was added, with its entry and END flags |
+| `McpServer` | `FastMCP(...)` / low-level `Server(...)` (and `McpServer` in TypeScript) with the tools, resources and prompts registered on it |
+| `ExternalService` | LLM providers, vector DBs, graph DBs, databases, caches, queues, cloud SDKs, payments, auth/backends and well-known APIs: from SDK imports, client objects, `"provider:model"` strings and URLs like `https://api.github.com/…` |
+| `EnvVar` | `os.getenv`, `os.environ[...]`, pydantic `BaseSettings` fields (with `env_prefix` and aliases), `process.env`, `import.meta.env`; marked required / has a default / optional, and flagged when a secret-looking name has a browser prefix such as `NEXT_PUBLIC_` |
+
+| Relationships | |
+|---|---|
+| `NEXT` | step → step (`kind`: `edge`, `conditional` via a router, or `goto` from `Command(goto=…)`) |
+| `RUNS` · `ROUTES` | step → the function (or sub-agent) it runs · step → the router function that decides where it goes next |
+| `USES_TOOL` | agent, `ToolNode` step or a function calling `bind_tools` → tool functions (`@tool`, `@function_tool`, tool lists, even when the list lives in another module) |
+| `EXPOSES` | MCP server → the functions behind `@mcp.tool()`, `@mcp.resource(...)`, `@mcp.prompt()` |
+| `USES` | function → service it calls, including through a client imported from another module |
+| `READS_ENV` | function / settings class → env var |
+
+Code under `docs/`, `examples/`, test folders and migrations isn't scanned for this layer, and nothing
+outside the repository (cloud consoles, deployed config) can be seen. Infrastructure files (compose,
+Kubernetes, Terraform) are left to tools built for them.
+
 ## MCP tools (MCP mode)
 
 | Tool | Shown to | What it does |
@@ -64,12 +96,15 @@ the same database. It adds a few that are free to compute:
 | `push_graph_to_neo4j` | model | Only when `NEO4J_URI` is set: write the graph into Neo4j (ids namespaced per repo) |
 
 The graph itself goes to the view as `structuredContent`, which MCP Apps hosts keep out of the model's
-context. Claude gets a compact summary instead (layout, endpoints and who calls them, most-called
-functions, most-imported files, test reach) and uses `explore_graph`/`search_graph` to dig further.
+context. Claude gets a compact summary instead (layout, endpoints and who calls them, agents and their
+flow, MCP servers, services, env vars and any leaked browser secrets, most-called functions, most-imported
+files, test reach) and uses `explore_graph`/`search_graph` to dig further.
 
 In the view you can:
 - click a node for its details and relationships; every entry is clickable;
 - double-click a file to show its functions, or a folder to fold or unfold it;
+- double-click an agent to break it down into its numbered steps, the functions they run, routers and tools;
+  a service to show the code that uses it; an MCP server for what it exposes; an env var for where it's read;
 - search with `/`, zoom with ctrl/⌘ + scroll (plain scroll once you've clicked into the map), and fit with `0`;
 - toggle node and link kinds in the legend;
 - in MCP mode, use "Ask Claude about this" to send the selection back to the chat.
@@ -206,7 +241,9 @@ repo's nodes.
 4. **Resolve**: module index (Python packages, relative imports, tsconfig paths), then calls, inheritance,
    tests and HTTP links. An edge is only added when its target is actually defined in the repo; there is
    no fuzzy name matching.
-5. **Deliver**: summary to the model, graph to the view, cached by commit.
+5. **GenAI layer** (`genai.py`): agents, tools, MCP servers, services and env vars, linked to the nodes
+   resolved above, in two passes so clients built in one module are followed where they're imported.
+6. **Deliver**: summary to the model, graph to the view, cached by commit.
 
 Limits: only Python and JS/TS are parsed into symbols (other languages show as files). Dynamic dispatch,
 dependency injection and reflection aren't followed. Route matching is static, so routes built at

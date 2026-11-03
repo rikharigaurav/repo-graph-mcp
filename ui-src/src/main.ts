@@ -1,7 +1,7 @@
 import { Bridge, type CallToolResult, type HostContext } from "./bridge";
 import {
-  KINDS, KIND, LINK_GROUPS, Model, SINGULAR, computeVisible, isFile, neighbourhood, relPhrase,
-  type GNode, type Group, type Kind, type Payload, type VisState,
+  KINDS, KIND, LINK_GROUPS, Model, NESTED_KINDS, OPENABLE, SINGULAR, breakdown, computeVisible, isFile, isGenAI,
+  neighbourhood, relPhrase, shapeOf, type GEdge, type GNode, type Group, type Kind, type Payload, type VisState,
 } from "./model";
 import { drawGlyph } from "./icons";
 import { GraphView } from "./view";
@@ -122,7 +122,9 @@ function load(payload: Payload): void {
     expanded: new Set(),
     collapsed: new Set(),
     focus: null,
+    opened: new Set(),
   };
+  for (const k of NESTED_KINDS) vis.kinds.delete(k); // an agent's steps and the env vars open on double-click
   fitToBudget(model, vis);
   focusLabel = "";
   renderHeader();
@@ -133,12 +135,14 @@ function load(payload: Payload): void {
       onToggle: (n) => toggleNode(n),
       onHover: (n, x, y) => hoverTip(n, x, y),
     });
+    view.emphasis = (n) => (vis?.opened.has(n.id) ? breakdown(n) : []);
   }
   view.select(null);
   view.inset = { right: 0, bottom: 0 };
   closePanel();
   refresh(true);
   const focus = payload.focus ? model.byId.get(payload.focus) : null;
+  if (focus && OPENABLE.has(focus.kind) && breakdown(focus).length) vis.opened.add(focus.id); // explore an agent → its breakdown
   if (focus && payload.focusDepth) {
     // whole graph shipped with a focus: show the neighbourhood, keep "Show whole repo" local
     setTimeout(() => {
@@ -259,13 +263,16 @@ function renderStatus(visibleCount: number): void {
   } else if (!vis.kinds.has("Function") && model.kindCounts.get("Function")) {
     notes.push("Functions are hidden. Double-click a file to show its functions.");
   }
+  if (model.kindCounts.get("GenAI") && !vis.opened.size) {
+    notes.push("Double-click an agent, MCP server, service or env var to break it down into the code behind it.");
+  }
   if (model.payload.truncated) notes.push(`Showing the ${fmt.format(model.nodes.length)} most connected of ${fmt.format(model.payload.totalNodes ?? 0)} nodes.`);
   if (!visibleCount) notes.push("Everything is filtered out. Turn some kinds back on below.");
   $("#status").textContent = notes.join(" ");
 }
 
 // ── legend / filters ──────────────────────────────────────────────────────
-function glyph(kind: Kind): HTMLCanvasElement {
+function glyph(kind: Kind, n?: GNode): HTMLCanvasElement {
   const size = 16;
   const c = el("canvas", "glyph");
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -273,7 +280,8 @@ function glyph(kind: Kind): HTMLCanvasElement {
   const ctx = c.getContext("2d")!;
   ctx.scale(dpr, dpr);
   const cs = getComputedStyle(document.documentElement);
-  drawGlyph(ctx, KIND[kind].shape, size, cs.getPropertyValue(KIND[kind].color).trim(), cs.getPropertyValue("--on-kind").trim());
+  const shape = n ? shapeOf(n) : KIND[kind].shape;
+  drawGlyph(ctx, shape, size, cs.getPropertyValue(KIND[kind].color).trim(), cs.getPropertyValue("--on-kind").trim());
   return c;
 }
 
@@ -283,7 +291,7 @@ function renderLegend(): void {
   kinds.replaceChildren();
   for (const k of KINDS) {
     const count = model.kindCounts.get(k.key) ?? 0;
-    if (!count) continue;
+    if (!count || k.chip === false) continue;
     const b = el("button", "chip");
     b.dataset.kind = k.key;
     b.setAttribute("aria-pressed", String(vis.kinds.has(k.key)));
@@ -327,6 +335,7 @@ function updateLegendCounts(): void {
 // ── selection, panel ──────────────────────────────────────────────────────
 function labelOf(n: GNode): string {
   if (n.kind === "Function" || n.kind === "Class") return n.props.qualname ?? n.name;
+  if (isGenAI(n.kind)) return n.name;
   if (n.kind === "Folder") return n.props.is_root ? n.name : `${n.path || n.name}/`;
   return n.kind === "ApiEndpoint" ? n.name : n.path || n.name;
 }
@@ -338,7 +347,13 @@ function ensureVisible(n: GNode): void {
     vis.expanded.add(n.fileOf.id);
     changed = true;
   }
-  if (!vis.kinds.has(n.kind) && !(n.kind === "Function" || n.kind === "Class")) { vis.kinds.add(n.kind); changed = true; }
+  if (NESTED_KINDS.has(n.kind) && !vis.kinds.has(n.kind) && n.parent && !vis.opened.has(n.parent.id)) {
+    vis.opened.add(n.parent.id);
+    changed = true;
+  } else if (!vis.kinds.has(n.kind) && !(n.kind === "Function" || n.kind === "Class") && !NESTED_KINDS.has(n.kind)) {
+    vis.kinds.add(n.kind);
+    changed = true;
+  }
   for (let a = n.parent; a; a = a.parent) if (vis.collapsed.delete(a.id)) changed = true;
   if (vis.focus && !vis.focus.has(n.id)) { vis.focus = null; changed = true; renderHeader(); }
   if (changed) refresh();
@@ -370,13 +385,56 @@ function toggleNode(n: GNode): void {
     if (vis.expanded.has(n.id)) vis.expanded.delete(n.id);
     else vis.expanded.add(n.id);
     refresh();
-  } else if (n.kind === "Folder" && !n.props.is_root) {
+  } else if ((n.kind === "Folder" && !n.props.is_root) || n.kind === "GenAI") {
     if (vis.collapsed.has(n.id)) vis.collapsed.delete(n.id);
     else vis.collapsed.add(n.id);
     refresh();
+  } else if (OPENABLE.has(n.kind)) {
+    if (vis.opened.has(n.id)) vis.opened.delete(n.id);
+    else vis.opened.add(n.id);
+    refresh();
+    select(n, false);
+    // frame the node together with what it broke down into, once they've moved into place
+    if (vis.opened.has(n.id) && view) {
+      const parts = [n, ...breakdown(n)];
+      setTimeout(() => view?.fit(true, parts.filter((p) => p.x !== undefined)), 420);
+    }
   } else {
     select(n, true);
   }
+}
+
+const isOpenable = (n: GNode) => OPENABLE.has(n.kind) && breakdown(n).length > 0;
+
+/** Agent: its steps in order, where each goes next and what it runs. */
+function flowSection(n: GNode): HTMLElement | null {
+  const steps = n.children.filter((c) => c.kind === "AgentStep").sort((a, b) => (a.props.order ?? 0) - (b.props.order ?? 0));
+  if (!steps.length) return null;
+  const sec = el("section", "rel");
+  sec.append(el("h3", "rel-title", `Flow (${steps.length} step${steps.length > 1 ? "s" : ""})`));
+  const ol = el("ol", "flow-list");
+  for (const st of steps) {
+    const li = el("li", "flow-step");
+    const b = el("button", "rel-item");
+    b.append(glyph(st.kind, st), el("span", "rel-name", st.name));
+    if (st.props.entry) b.append(el("span", "flow-badge", "start"));
+    b.onclick = () => select(st, true);
+    li.append(b);
+    const nexts = st.outE.filter((e) => e.rel === "NEXT");
+    const runs = st.outE.filter((e) => e.rel === "RUNS").map((e) => e.t);
+    const tools = st.outE.filter((e) => e.rel === "USES_TOOL").map((e) => e.t);
+    const lines: string[] = [];
+    if (runs.length) lines.push(`runs ${runs.map((r) => r.kind === "Agent" ? `${r.name} (sub-agent)` : `${r.name}()`).join(", ")}`);
+    else if (st.props.kind === "tools") lines.push(`runs the agent's tools${tools.length ? `: ${tools.map((t) => t.name).join(", ")}` : ""}`);
+    else if (st.props.runs) lines.push(`runs ${st.props.runs} (not found in the code graph)`);
+    const to = nexts.map((e) => e.t.name + (e.props?.kind === "conditional" ? " (if)" : e.props?.kind === "goto" ? " (goto)" : ""));
+    if (st.props.can_end) to.push("END");
+    if (to.length) lines.push(`then → ${to.join(", ")}`);
+    if (lines.length) li.append(el("p", "flow-note", lines.join(" · ")));
+    ol.append(li);
+  }
+  sec.append(ol);
+  return sec;
 }
 
 function openPanel(n: GNode): void {
@@ -385,9 +443,13 @@ function openPanel(n: GNode): void {
   p.hidden = false;
   const body = el("div", "panel-body");
   const kind = el("p", "panel-kind");
-  kind.append(glyph(n.kind), document.createTextNode(SINGULAR[n.kind] + (n.props.defined_in_repo === false ? ", not defined in this repo" : "")));
-  const title = el("h2", `panel-title ${["Function", "Class", "ApiEndpoint"].includes(n.kind) ? "is-code" : ""}`, labelOf(n));
+  const kindText = n.kind === "ExternalService" && n.props.category ? `${n.props.category} service`
+    : n.kind === "Function" && n.props.ai_tool ? `Function, used as ${String(n.props.ai_tool).replace(/^(MCP|agent|LangChain)/, (m) => m === "agent" ? "an agent" : m === "MCP" ? "an MCP" : "a LangChain")}`
+    : SINGULAR[n.kind] + (n.props.defined_in_repo === false ? ", not defined in this repo" : "");
+  kind.append(glyph(n.kind, n), document.createTextNode(kindText));
+  const title = el("h2", `panel-title ${["Function", "Class", "ApiEndpoint", "AgentStep", "EnvVar"].includes(n.kind) ? "is-code" : ""}`, labelOf(n));
   body.append(kind, title);
+  if (n.props.warning) body.append(el("p", "panel-warn", String(n.props.warning)));
 
   if (n.path && n.kind !== "Folder") {
     const loc = el("p", "panel-loc");
@@ -405,6 +467,20 @@ function openPanel(n: GNode): void {
   if (n.props.summary) body.append(el("p", "panel-summary", String(n.props.summary)));
   const facts: string[] = [];
   if (n.props.framework) facts.push(String(n.props.framework));
+  if (n.kind === "Agent" && n.props.steps) facts.push(`${n.props.steps} steps`);
+  if (n.kind === "McpServer") {
+    const parts = [["tools", n.props.tools], ["resources", n.props.resources], ["prompts", n.props.prompts]]
+      .filter(([, c]) => c).map(([w, c]) => `${c} ${c === 1 ? String(w).slice(0, -1) : w}`);
+    if (parts.length) facts.push(parts.join(", "));
+    if (n.props.transport) facts.push(`${n.props.transport} transport`);
+  }
+  if (n.kind === "EnvVar") {
+    facts.push(n.props.mode === "required" ? "Required: the app fails without it" : n.props.mode === "default" ? "Has a default" : "Optional: empty when unset");
+    if (n.props.reads) facts.push(`read in ${n.props.reads} place${n.props.reads > 1 ? "s" : ""}`);
+  }
+  if (n.kind === "EnvGroup") facts.push(`${n.props.count} variables, ${n.props.required ?? 0} required`);
+  if (n.kind === "ExternalService" && n.props.sdks?.length) facts.push(`via ${n.props.sdks.slice(0, 3).join(", ")}`);
+  if (n.kind === "AgentStep" && n.props.kind === "tools") facts.push("tool-calling step");
   if (n.props.test_framework && n.props.test_framework !== "None") facts.push(String(n.props.test_framework));
   if (n.props.language) facts.push(String(n.props.language));
   if (n.props.loc) facts.push(`${fmt.format(n.props.loc)} lines`);
@@ -412,29 +488,51 @@ function openPanel(n: GNode): void {
   if (n.props.async) facts.push("async");
   if (facts.length) body.append(el("p", "panel-facts", facts.join(", ")));
 
+  if (n.kind === "Agent") {
+    const flow = flowSection(n);
+    if (flow) body.append(flow);
+  }
+  const unresolved = [...(n.props.unresolved ?? []), ...(n.props.tools_unresolved ?? []).map((t: string) => `tool ${t}`)];
+  if (unresolved.length) {
+    const sec = el("section", "rel");
+    sec.append(el("h3", "rel-title", "Not linked to code"), el("p", "panel-note", unresolved.slice(0, 8).join("; ") + "."));
+    body.append(sec);
+  }
+
   // relationships grouped by how they read from this node
-  const groups = new Map<string, GNode[]>();
+  const groups = new Map<string, { o: GNode; e: GEdge }[]>();
   for (const e of n.outE) {
+    if (n.kind === "Agent" && e.rel === "BELONGS_TO" && e.t.kind === "GenAI") continue;
     const k = relPhrase(e.rel, "out");
-    (groups.get(k) ?? groups.set(k, []).get(k)!).push(e.t);
+    (groups.get(k) ?? groups.set(k, []).get(k)!).push({ o: e.t, e });
   }
   for (const e of n.inE) {
+    if (n.kind === "Agent" && e.s.kind === "AgentStep" && e.rel === "BELONGS_TO") continue; // shown as the flow
     const k = relPhrase(e.rel, "in");
-    (groups.get(k) ?? groups.set(k, []).get(k)!).push(e.s);
+    (groups.get(k) ?? groups.set(k, []).get(k)!).push({ o: e.s, e });
   }
-  const order = ["Called by", "Calls", "Requested by", "Requests", "Tested by", "Tests", "Imported by", "Imports", "Extends", "Extended by", "Contains", "Inside"];
+  const order = ["Runs", "Decided by", "Uses tools", "Exposes", "Goes to", "Comes after", "Run by", "Decides for", "Tool of", "Exposed by",
+    "Uses", "Used by", "Reads", "Read by", "Called by", "Calls", "Requested by", "Requests", "Tested by", "Tests", "Imported by", "Imports",
+    "Extends", "Extended by", "Contains", "Inside"];
   for (const key of order) {
     const list = groups.get(key);
     if (!list?.length) continue;
-    const uniq = [...new Set(list)];
+    const seen = new Set<GNode>();
+    const uniq = list.filter(({ o }) => !seen.has(o) && !!seen.add(o));
     const sec = el("section", "rel");
     sec.append(el("h3", "rel-title", `${key} (${fmt.format(uniq.length)})`));
     const ul = el("ul", "rel-list");
-    for (const o of uniq.slice(0, 40)) {
+    for (const { o, e } of uniq.slice(0, 40)) {
       const li = el("li");
       const b = el("button", "rel-item");
-      b.append(glyph(o.kind), el("span", "rel-name", labelOf(o)));
-      if ((o.kind === "Function" || o.kind === "Class") && o.path) b.append(el("span", "rel-path", o.path));
+      b.append(glyph(o.kind, o), el("span", "rel-name", labelOf(o)));
+      const where = !e.props?.line ? "" : e.props.file && e.props.file !== o.path ? `${e.props.file}:${e.props.line}` : `line ${e.props.line}`;
+      if (where) {
+        const tip = [e.props?.how, e.props?.basis === "inferred" ? "inferred" : ""].filter(Boolean).join(" · ");
+        const span = el("span", "rel-path", where);
+        if (tip) span.title = tip;
+        b.append(span);
+      } else if ((o.kind === "Function" || o.kind === "Class") && o.path) b.append(el("span", "rel-path", o.path));
       b.onclick = () => select(o, true);
       li.append(b);
       ul.append(li);
@@ -445,6 +543,13 @@ function openPanel(n: GNode): void {
   }
 
   const actions = el("div", "panel-actions");
+  if (isOpenable(n)) {
+    const open = el("button", "btn", vis?.opened.has(n.id) ? "Fold back" : n.kind === "Agent" ? "Break down into steps and code"
+      : n.kind === "ExternalService" ? "Show the code that uses it" : n.kind === "EnvVar" ? "Show where it's read"
+      : n.kind === "EnvGroup" ? "Show all variables" : "Show its parts");
+    open.onclick = () => { toggleNode(n); openPanel(n); };
+    actions.append(open);
+  }
   const near = el("button", "btn", "Show only its neighbours");
   near.onclick = () => focusOn(n);
   actions.append(near);
@@ -615,6 +720,17 @@ function wire(): void {
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => view?.readPalette());
   window.addEventListener("resize", () => bridge.connected && sizeToHost());
 }
+
+// read-only handle for automated checks of the published page
+(window as any).__repoGraph = {
+  screenOf(id: string) {
+    const n = model?.byId.get(id);
+    if (!n || !view || n.x === undefined) return null;
+    const r = $("#canvas").getBoundingClientRect();
+    return { x: r.left + n.x * view.k + view.tx, y: r.top + n.y! * view.k + view.ty, visible: view.nodes.includes(n) };
+  },
+  visibleIds: () => view?.nodes.map((n) => n.id) ?? [],
+};
 
 async function boot(): Promise<void> {
   wire();

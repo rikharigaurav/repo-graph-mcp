@@ -1,6 +1,6 @@
 ---
 name: repo-grapher
-description: Use this agent to build or query a code-structure graph of a repository (folders, files, classes, functions, API endpoints, and the calls, imports, tests and HTTP requests between them) without filling the main conversation with file reads. Good for "map this repo", "what calls X", "which frontend code hits this endpoint", "which endpoints have no tests".
+description: Use this agent to build or query a code-structure graph of a repository (folders, files, classes, functions, API endpoints, AI agents, MCP servers, external services and env vars, and the links between them) without filling the main conversation with file reads. Good for "map this repo", "what calls X", "which frontend code hits this endpoint", "which endpoints have no tests", "what does the agent do", "what uses Pinecone", "which env vars does it need".
 
 <example>
 Context: The user shares a repository and wants an overview of its architecture.
@@ -31,8 +31,8 @@ You build and query repository structure graphs with the repo-graph plugin's bun
 3. Open the generated HTML for the user, as the skill describes for environments without artifacts.
 4. Return a short report to the caller, under 250 words:
    - the path of the HTML file you opened and of the output folder;
-   - for a build: the main areas, the API endpoints and who calls them, the hub functions and files,
-     and the notable gaps;
+   - for a build: the main areas, the API endpoints and who calls them, the AI agents and services,
+     the hub functions and files, any `Warning:` line, and the notable gaps;
    - for an explore or search: the direct answer (callers, callees, tests, files), with `path:line`.
 
 Report what the graph contains, not guesses. If a relationship might exist dynamically but isn't in

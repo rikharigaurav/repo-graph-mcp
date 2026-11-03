@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import graph as G
+from .genai import add_genai_layer
 from .classify import classify, detect_test_framework, ext_of, is_ignored_dir, language_of
 from .graph import CodeGraph, Node
 from .parsers.base import FileParse, normalize_route
@@ -75,6 +76,7 @@ class Builder:
         self.endpoint_by_route: dict[str, list[str]] = defaultdict(list)
         self._routes_by_len: dict[int, list[tuple[list[str], str, list[str]]]] | None = None
         self.counters: Counter = Counter()
+        self.genai_stats: dict[str, int] = {}
 
     # ── 1. walk ────────────────────────────────────────────────────────────
     def walk(self) -> None:
@@ -649,6 +651,7 @@ class Builder:
             "files_too_large": self.counters["files_too_large"] + extra.get("skipped_large", 0),
             "files_minified": self.counters["files_minified"], "files_failed": self.counters["files_failed"],
             "build_ms": int((time.perf_counter() - started) * 1000),
+            **({"genai": self.genai_stats} if self.genai_stats else {}),
         }
         return self.g
 
@@ -665,6 +668,8 @@ def build_graph(root: Path, repo: dict, progress: Callable[[float, str], None] |
     b.resolve_imports()
     b.progress(0.9, "Linking calls")
     b.resolve_calls()
+    b.progress(0.95, "Finding agents, services and env vars")
+    add_genai_layer(b)
     return b.finalize(started, extra or {})
 
 
