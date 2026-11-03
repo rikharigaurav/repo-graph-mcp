@@ -4,6 +4,7 @@ import {
   neighbourhood, relPhrase, shapeOf, type GEdge, type GNode, type Group, type Kind, type Payload, type VisState,
 } from "./model";
 import { drawGlyph } from "./icons";
+import { buildOverview, renderOverview, type OvItem } from "./overview";
 import { GraphView } from "./view";
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -22,6 +23,9 @@ let view: GraphView | null = null;
 let vis: VisState | null = null;
 let lastInput: Record<string, any> = {};
 let focusLabel = "";
+let mode: "overview" | "map" = "map";
+let hasOverview = false;
+let stopOverview: (() => void) | null = null;
 
 // ── host integration ──────────────────────────────────────────────────────
 function applyHostContext(ctx: HostContext): void {
@@ -127,6 +131,18 @@ function load(payload: Payload): void {
   for (const k of NESTED_KINDS) vis.kinds.delete(k); // an agent's steps and the env vars open on double-click
   fitToBudget(model, vis);
   focusLabel = "";
+  // the overview is the calm way in; explore results and focused pages open straight on the map
+  stopOverview?.();
+  const ov = buildOverview(model);
+  hasOverview = payload.mode !== "explore" && ov.itemCount >= 2;
+  if (hasOverview) {
+    stopOverview = renderOverview($("#overview"), ov, String(payload.repo?.name ?? model.repoLabel), {
+      glyph: (k, n) => glyph(k, n),
+      open: (it) => openItem(it),
+    });
+  }
+  mode = hasOverview && !payload.focus ? "overview" : "map";
+  applyMode();
   renderHeader();
   renderLegend();
   if (!view) {
@@ -218,7 +234,69 @@ function refresh(reseed = false): void {
   view.collapsed = vis.collapsed;
   view.setData(nodes, links, { reseed });
   renderStatus(nodes.length);
-  updateLegendCounts();
+  renderLegend();
+}
+
+// ── overview ⇄ map ────────────────────────────────────────────────────────
+function applyMode(): void {
+  $("#overview").hidden = mode !== "overview";
+  $("#app").dataset.mode = mode;
+  $("#modes").hidden = !hasOverview;
+  document.querySelectorAll<HTMLButtonElement>("#modes button").forEach((b) => {
+    b.setAttribute("aria-selected", String(b.dataset.mode === mode));
+  });
+  $("#scope-overview").hidden = !hasOverview;
+  renderHeader();
+}
+
+function setMode(m: "overview" | "map"): void {
+  if (m === mode) return;
+  if (m === "overview") select(null, false);
+  mode = m;
+  applyMode();
+}
+
+/** A row of the overview opens just that part of the graph. */
+function openItem(it: OvItem): void {
+  if (!model || !vis || !view) return;
+  setMode("map");
+  vis.opened.clear(); // each row opens on its own, not on top of the last one
+  if (it.node) {
+    const n = it.node;
+    if (OPENABLE.has(n.kind) && breakdown(n).length) vis.opened.add(n.id);
+    focusOn(n, 1);
+    select(n, false);
+    return;
+  }
+  if (it.overflow || !it.members.length) { void showAll(); return; }
+  // a folder group: its files (and their code when that stays small), plus what they link to
+  const inside: GNode[] = [];
+  const stack = [...it.members];
+  while (stack.length) {
+    const n = stack.pop()!;
+    inside.push(n);
+    stack.push(...n.children);
+  }
+  const code = inside.filter((n) => n.kind === "Function" || n.kind === "Class").length;
+  const detail = code <= 40;
+  const shown = (n: GNode): GNode => (!detail && (n.kind === "Function" || n.kind === "Class") && n.fileOf ? n.fileOf : n);
+  const keep = new Set<string>();
+  for (const n of inside) keep.add(shown(n).id);
+  for (const n of inside) {
+    for (const e of [...n.outE, ...n.inE]) {
+      if (e.group === "contains") continue;
+      keep.add(shown(e.s).id);
+      keep.add(shown(e.t).id);
+    }
+  }
+  for (const id of [...keep]) for (let a = model.byId.get(id)?.parent; a; a = a.parent) keep.add(a.id);
+  for (const n of inside) for (let a = n.parent; a; a = a.parent) vis.collapsed.delete(a.id);
+  for (const f of it.members) if (detail) vis.expanded.add(f.id); else vis.expanded.delete(f.id);
+  vis.focus = keep;
+  focusLabel = (it.prefix ?? "") + it.label;
+  select(null, false);
+  renderHeader();
+  refresh(true);
 }
 
 function renderHeader(): void {
@@ -241,7 +319,7 @@ function renderHeader(): void {
   if (st.build_ms !== undefined) parts.push(`parsed in ${(st.build_ms / 1000).toFixed(st.build_ms < 1000 ? 2 : 1)} s`);
   meta.textContent = parts.join(", ");
   const scope = $("#scope");
-  const exploring = model.payload.mode === "explore" || !!vis?.focus;
+  const exploring = mode === "map" && (model.payload.mode === "explore" || !!vis?.focus);
   scope.hidden = !exploring;
   if (exploring) {
     $("#scope-label").textContent = focusLabel ? `Around ${focusLabel}` : "Partial view";
@@ -260,6 +338,8 @@ function renderStatus(visibleCount: number): void {
       folded ? `${fmt.format(folded)} folder${folded > 1 ? "s" : ""} folded` : "",
     ].filter(Boolean).join(" and ");
     notes.push(`Overview of a large repo: ${what}. Double-click a folder or file to open it, or turn kinds on below.`);
+  } else if (vis.focus && mode === "map" && [...vis.focus].every((id) => model!.byId.get(id)?.kind !== "Function")) {
+    notes.push("Showing files only. Double-click a file to open its functions.");
   } else if (!vis.kinds.has("Function") && model.kindCounts.get("Function")) {
     notes.push("Functions are hidden. Double-click a file to show its functions.");
   }
@@ -287,10 +367,19 @@ function glyph(kind: Kind, n?: GNode): HTMLCanvasElement {
 
 function renderLegend(): void {
   if (!model || !vis) return;
+  // only what's in scope: a focused view lists the few kinds it actually shows
+  const scope = vis.focus;
+  const kindCounts = new Map<Kind, number>();
+  for (const n of model.nodes) if (!scope || scope.has(n.id)) kindCounts.set(n.kind, (kindCounts.get(n.kind) ?? 0) + 1);
+  const groupCounts = new Map<Group, number>();
+  for (const e of model.edges) {
+    if (scope && !(scope.has(e.s.id) && scope.has(e.t.id))) continue;
+    groupCounts.set(e.group, (groupCounts.get(e.group) ?? 0) + 1);
+  }
   const kinds = $("#kinds");
   kinds.replaceChildren();
   for (const k of KINDS) {
-    const count = model.kindCounts.get(k.key) ?? 0;
+    const count = kindCounts.get(k.key) ?? 0;
     if (!count || k.chip === false) continue;
     const b = el("button", "chip");
     b.dataset.kind = k.key;
@@ -308,7 +397,7 @@ function renderLegend(): void {
   const groups = $("#groups");
   groups.replaceChildren();
   for (const g of LINK_GROUPS) {
-    const count = model.groupCounts.get(g.key) ?? 0;
+    const count = groupCounts.get(g.key) ?? 0;
     if (!count) continue;
     const b = el("button", "chip chip-link");
     b.dataset.group = g.key;
@@ -324,12 +413,6 @@ function renderLegend(): void {
     };
     groups.appendChild(b);
   }
-}
-
-function updateLegendCounts(): void {
-  document.querySelectorAll<HTMLButtonElement>("#kinds .chip").forEach((b) => {
-    b.setAttribute("aria-pressed", String(vis?.kinds.has(b.dataset.kind as Kind)));
-  });
 }
 
 // ── selection, panel ──────────────────────────────────────────────────────
@@ -383,7 +466,19 @@ function toggleNode(n: GNode): void {
   if (!vis) return;
   if (isFile(n.kind)) {
     if (vis.expanded.has(n.id)) vis.expanded.delete(n.id);
-    else vis.expanded.add(n.id);
+    else {
+      vis.expanded.add(n.id);
+      if (vis.focus) { // a focused view grows to include the file's code and what it links to
+        const todo = [...n.children];
+        while (todo.length) {
+          const c = todo.pop()!;
+          vis.focus.add(c.id);
+          for (const e of [...c.outE, ...c.inE]) if (e.group !== "contains") { vis.focus.add(e.s.id); vis.focus.add(e.t.id); }
+          todo.push(...c.children);
+        }
+        for (const id of [...vis.focus]) for (let a = model?.byId.get(id)?.parent; a; a = a.parent) vis.focus.add(a.id);
+      }
+    }
     refresh();
   } else if ((n.kind === "Folder" && !n.props.is_root) || n.kind === "GenAI") {
     if (vis.collapsed.has(n.id)) vis.collapsed.delete(n.id);
@@ -666,6 +761,7 @@ function setupSearch(): void {
     items = [];
     render();
     input.blur();
+    setMode("map");
     select(n, true);
   };
   input.addEventListener("input", () => {
@@ -704,6 +800,10 @@ function wire(): void {
   $("#zoom-in").onclick = () => view?.zoomBy(1.3);
   $("#zoom-out").onclick = () => view?.zoomBy(1 / 1.3);
   $("#scope-reset").onclick = () => void showAll();
+  $("#scope-overview").onclick = () => setMode("overview");
+  document.querySelectorAll<HTMLButtonElement>("#modes button").forEach((b) => {
+    b.onclick = () => setMode(b.dataset.mode as "overview" | "map");
+  });
   $("#fullscreen").onclick = async () => {
     const next = bridge.hostContext.displayMode === "fullscreen" ? "inline" : "fullscreen";
     try {

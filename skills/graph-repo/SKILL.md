@@ -8,7 +8,7 @@ description: >
   or invokes /graph-repo. It builds a structural graph of the code, including its AI agents, MCP servers,
   external services and env vars, and shows it interactively.
 metadata:
-  version: "0.3.0"
+  version: "0.4.0"
 ---
 
 # Graph a repository
@@ -98,7 +98,10 @@ the user's cache folder (never into their global Python); later runs start immed
   rather than "not used".
 - Only Python and JavaScript/TypeScript are parsed into symbols; other languages appear as files. Calls
   are resolved statically, so say so when the user asks about dynamic dispatch, plugins or reflection.
-- In the view: click a node for details, double-click a file to show its functions or a folder to
+- The view opens on an overview (Frontend → API → Backend → AI & services, with bundled links); clicking a
+  row opens just that part as a graph, and Overview / Map switches between them. When you send the user
+  to a part of the graph, name the row to click (e.g. "click `utils/` in the Backend column").
+- In the map: click a node for details, double-click a file to show its functions or a folder to
   fold/unfold it, double-click an agent, service, MCP server or env var to break it down into the code
   behind it, press `/` to search, toggle kinds in the legend. Large repos open as an overview.
 

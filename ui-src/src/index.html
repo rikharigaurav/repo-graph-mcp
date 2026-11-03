@@ -18,6 +18,10 @@
       <p id="meta" class="meta"></p>
     </div>
     <div class="tools">
+      <div id="modes" class="seg" role="tablist" aria-label="View" hidden>
+        <button type="button" role="tab" data-mode="overview">Overview</button>
+        <button type="button" role="tab" data-mode="map">Map</button>
+      </div>
       <div class="search-wrap">
         <input id="search" type="search" placeholder="Find a file, function or route" autocomplete="off" spellcheck="false"
                role="combobox" aria-label="Find a node" aria-autocomplete="list" aria-controls="results" aria-expanded="false">
@@ -29,9 +33,11 @@
   <div id="scope" class="scope" hidden>
     <span id="scope-label"></span>
     <button id="scope-reset" class="link-btn" type="button">Show whole repo</button>
+    <button id="scope-overview" class="link-btn" type="button" hidden>Back to overview</button>
   </div>
   <main class="stage">
     <div id="canvas" class="canvas"></div>
+    <div id="overview" class="overview" hidden></div>
     <div id="state" class="state"></div>
     <div id="tip" class="tip" hidden></div>
     <aside id="panel" class="panel" aria-label="Node details" hidden></aside>

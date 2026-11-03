@@ -17,6 +17,12 @@ It runs two ways:
 - **MCP mode** (optional). A small server renders the graph inside the chat itself, as an MCP App. You
   can run it locally or host it once for claude.ai on web and mobile.
 
+![The overview: frontend, API, backend and AI & services, with the links between them](docs/graph-overview.png)
+
+It opens on an **overview**: the repo as four calm columns (Frontend → API → Backend → AI & services) with
+bundled arrows between them. Hover a row to see what it talks to; click it to open just that part as an
+interactive graph. The full map is one click away.
+
 ![The graph of Read-Code-Structure rendered inside the chat](docs/graph-view.png)
 
 <table><tr>
@@ -101,6 +107,8 @@ flow, MCP servers, services, env vars and any leaked browser secrets, most-calle
 files, test reach) and uses `explore_graph`/`search_graph` to dig further.
 
 In the view you can:
+- start from the overview: hover a folder, endpoint, agent or service to light up its links, click it to
+  open only that part as a graph (big folders open as files first), and switch with Overview / Map;
 - click a node for its details and relationships; every entry is clickable;
 - double-click a file to show its functions, or a folder to fold or unfold it;
 - double-click an agent to break it down into its numbered steps, the functions they run, routers and tools;
