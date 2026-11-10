@@ -8,7 +8,7 @@ description: >
   or invokes /graph-repo. It builds a structural graph of the code, including its AI agents, MCP servers,
   external services and env vars, and shows it interactively.
 metadata:
-  version: "0.4.0"
+  version: "0.5.0"
 ---
 
 # Graph a repository
@@ -39,7 +39,7 @@ the user's cache folder (never into their global Python); later runs start immed
 2. **Build.** Quote paths that contain spaces.
 
    ```
-   PY "<skill dir>/scripts/graph_repo.py" build <repo> [--ref <branch>] [--path <sub-folder>] [--out <dir>]
+   PY "<skill dir>/scripts/graph_repo.py" build <repo> [--ref <branch>] [--path <sub-folder>] [--out <dir>] [--history N]
    ```
 
    `<repo>` is what the user gave: GitHub URL (including `/tree/<branch>/<folder>` links), `owner/repo`,
@@ -78,6 +78,16 @@ the user's cache folder (never into their global Python); later runs start immed
    (and `explore-<node>-artifact.html`): the whole graph, opened on that neighbourhood. Show it the
    same way as step 3 when the user wants to see it.
    If `explore` says nothing matched, run `search` and retry with the returned id.
+
+## Version control
+
+In a git checkout the summary has a `Version control:` block: branch and commit, how many commits aren't
+pushed, the **uncommitted changes** as graph changes (functions added/changed/removed, new endpoints,
+services, env vars), and the last 8 commits (`--history N`, `0` for none) the same way. The view's header
+chip opens the same timeline. Use it when the user asks what changed, what a commit did, what isn't
+pushed, or to review work in progress, including edits you just made: run `build` again after editing.
+It's fast (snapshots per commit SHA and parses per file content are cached), so rebuild freely and
+republish the page to show the latest state.
 
 ## Reading the graph
 

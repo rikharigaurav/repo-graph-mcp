@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "repo_graph_mcp"
 DST = ROOT / "skills" / "graph-repo" / "scripts" / "repo_graph_mcp"
 FILES = [
-    "__init__.py", "graph.py", "classify.py", "builder.py", "genai.py", "summary.py", "fetch.py",
+    "__init__.py", "graph.py", "classify.py", "builder.py", "genai.py", "parsecache.py", "history.py", "store.py", "summary.py", "fetch.py",
     "parsers/__init__.py", "parsers/base.py", "parsers/python_parser.py", "parsers/js_parser.py",
     "ui/graph-view.html",
 ]

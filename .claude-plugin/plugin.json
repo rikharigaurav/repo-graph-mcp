@@ -1,6 +1,6 @@
 {
   "name": "repo-graph",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Share a repo with Claude and get its code-structure graph (folders, files, classes, functions, API endpoints, calls, imports, tests) plus its AI agents, MCP servers, services and env vars as an interactive view. Works on install with no server: Claude runs the bundled graph builder itself. Graph only, no LLM summaries or embeddings, so it takes seconds.",
   "author": {
     "name": "rikharigaurav"

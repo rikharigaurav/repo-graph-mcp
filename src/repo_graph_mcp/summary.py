@@ -22,7 +22,8 @@ def _fmt_counts(c: dict, order: tuple[str, ...] | None = None) -> str:
     return " · ".join(f"{k} {v}" for k, v in items)
 
 
-def summarize(g: CodeGraph, graph_id: str | None, elapsed_s: float, ui_shown: bool, cached: bool) -> str:
+def summarize(g: CodeGraph, graph_id: str | None, elapsed_s: float, ui_shown: bool, cached: bool,
+              history: dict | None = None) -> str:
     """`graph_id=None` omits the MCP follow-up hint (the agent-mode CLI prints its own)."""
     s = g.stats
     labels = s.get("labels", {})
@@ -90,6 +91,7 @@ def summarize(g: CodeGraph, graph_id: str | None, elapsed_s: float, ui_shown: bo
         if len(defined) > 25:
             lines.append(f"  … +{len(defined) - 25} more (search_graph label=ApiEndpoint)")
 
+    lines += _history_section(history)
     lines += _genai_section(g)
 
     called = Counter()
@@ -130,6 +132,28 @@ def summarize(g: CodeGraph, graph_id: str | None, elapsed_s: float, ui_shown: bo
                   "nodes without symbols. Edges are resolved statically (imports, self/this, module instances); "
                   "dynamic dispatch isn't followed."]
     return "\n".join(lines)
+
+
+def _history_section(h: dict | None) -> list[str]:
+    """Branch, what isn't committed or pushed, and what recent commits changed, as graph changes."""
+    if not h:
+        return []
+    up = h.get("upstream")
+    state = []
+    if up:
+        state.append(f"{h['ahead']} commit{'s' if h['ahead'] != 1 else ''} not pushed to {up}" if h.get("ahead")
+                     else f"in sync with {up}")
+        if h.get("behind"):
+            state.append(f"{h['behind']} behind")
+    out = ["", f"Version control: {h.get('branch')} @ {h.get('short')}" + (f" ({', '.join(state)})" if state else "")]
+    for e in h.get("entries", [])[:9]:
+        if e["kind"] == "working":
+            files = ", ".join(f["path"] for f in e["files"][:4]) + (" …" if len(e["files"]) > 4 else "")
+            out.append(f"  Uncommitted ({len(e['files'])} files: {files}): {e['summary']}")
+        else:
+            flag = "" if e.get("pushed") or not up else " [not pushed]"
+            out.append(f"  {e['short']} {e['title'][:70]}{flag}: {e['summary']}")
+    return out
 
 
 def _genai_section(g: CodeGraph) -> list[str]:

@@ -91,6 +91,35 @@ Code under `docs/`, `examples/`, test folders and migrations isn't scanned for t
 outside the repository (cloud consoles, deployed config) can be seen. Infrastructure files (compose,
 Kubernetes, Terraform) are left to tools built for them.
 
+### Version control: uncommitted work and recent commits
+
+![Picking a commit marks what it added and changed on the overview](docs/graph-changes.png)
+
+When the repo is a git checkout (a local folder, or a GitHub repo cloned with some history), the graph
+also shows **what changed**, as graph changes rather than line diffs:
+
+- **Uncommitted changes** on top of the last commit: functions added, changed and removed, new
+  endpoints, services, agents and env vars, and the callers of changed code that may need a look.
+- **The last 8 commits** (`--history N`), each against its parent, with author, time, a link to the
+  commit on GitHub, and whether it's **pushed** to the upstream branch (`origin/main`) yet.
+
+The header shows `main @ 1381b9f · ● 2 uncommitted · ↑2 not pushed`; click it for the timeline. Picking an
+entry puts `+2 ~3 −1` on the overview rows it touched and rings the changed nodes on the map (green
+added, amber changed); "Show these in the map" narrows the map to them.
+
+**It's fast because nothing is built twice.** Each commit's graph is saved by its SHA, and each file's
+parse by a hash of its bytes, in the repo-graph cache folder:
+
+| Situation | What happens | Typical time |
+|---|---|---|
+| Clean checkout, built before | load the saved graph of HEAD | ~0.1 s |
+| You (or Claude) edited files | rebuild, parsing only the edited files | under 1 s |
+| New commit | build that commit only; older ones come from the cache | under 1 s |
+| GitHub repo, no new commits | `git ls-remote` only, no clone | under 1 s |
+
+Old commits are read with `git archive` into a temporary folder: the repository is never modified and
+nothing is fetched from the network for local repos.
+
 ## MCP tools (MCP mode)
 
 | Tool | Shown to | What it does |
@@ -223,6 +252,8 @@ Hosted mode never reads paths on the server's own disk unless you set `REPO_GRAP
 | `REPO_GRAPH_MAX_FILE_KB` | `768` | Larger files are skipped |
 | `REPO_GRAPH_MAX_DOWNLOAD_MB` | `300` | Archive size limit |
 | `REPO_GRAPH_UI_MAX_NODES` | `6000` | Nodes sent to the view (most structural first) |
+| `REPO_GRAPH_HISTORY` | `8` | Recent commits shown as changes (`0` turns history off) |
+| `REPO_GRAPH_HOME` | user cache folder | Agent mode: where commit snapshots, parse cache and history are kept |
 | `REPO_GRAPH_MAX_CONCURRENT_BUILDS` | `2` | Parallel builds in hosted mode |
 | `REPO_GRAPH_AUTH_TOKEN` | – | HTTP mode: require `Authorization: Bearer …` or `?key=…` |
 | `REPO_GRAPH_ALLOWED_HOSTS` | – | HTTP mode: enable DNS-rebinding protection for these hostnames |
@@ -238,7 +269,8 @@ repo's nodes.
 
 ## How it works
 
-1. **Fetch**: agent mode runs `git clone --depth 1` with your own credentials. MCP mode first resolves
+1. **Fetch**: agent mode runs `git clone --depth <history + 1>` with your own credentials (after a
+   `git ls-remote` that skips the clone when that commit is already cached). MCP mode first resolves
    the commit SHA (one small GitHub API call) and stops there on a cache hit; otherwise it downloads the
    tarball and extracts it, skipping `node_modules`, build output, VCS folders and oversized files.
    `/tree/<branch>/<folder>` links are matched against the real branch names, so branches containing
@@ -251,7 +283,9 @@ repo's nodes.
    no fuzzy name matching.
 5. **GenAI layer** (`genai.py`): agents, tools, MCP servers, services and env vars, linked to the nodes
    resolved above, in two passes so clients built in one module are followed where they're imported.
-6. **Deliver**: summary to the model, graph to the view, cached by commit.
+6. **Version control** (`history.py`, `parsecache.py`): in a git checkout, the uncommitted changes and
+   the last N commits as graph diffs; graphs saved per commit SHA, parses per file content hash.
+7. **Deliver**: summary to the model, graph to the view, cached by commit.
 
 Limits: only Python and JS/TS are parsed into symbols (other languages show as files). Dynamic dispatch,
 dependency injection and reflection aren't followed. Route matching is static, so routes built at

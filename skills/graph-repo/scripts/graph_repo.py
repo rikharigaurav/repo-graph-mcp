@@ -4,13 +4,14 @@
 Claude runs this with its own shell/code tools. It needs only Python >= 3.10; tree-sitter is
 installed on first use into a private virtualenv (never into your global Python).
 
-    python graph_repo.py build   <repo> [--ref REF] [--path SUBDIR] [--out DIR]
+    python graph_repo.py build   <repo> [--ref REF] [--path SUBDIR] [--out DIR] [--history N]
     python graph_repo.py explore <DIR> <node> [--depth N] [--direction in|out|both] [--relations CALLS,IMPORTS]
     python graph_repo.py search  <DIR> <query> [--label LABEL] [--limit N]
 
 <repo> is a GitHub URL (incl. /tree/<branch>/<dir> links), owner/repo, any git URL, or a local path.
 `build` writes DIR/graph.html (interactive, self-contained), DIR/graph.json and DIR/summary.txt and prints
-the summary. `explore` writes DIR/explore-<node>.html focused on one node and prints its relationships.
+the summary. In a git checkout it also shows uncommitted changes and the last N commits as graph changes;
+each commit's graph is cached by its SHA, so rebuilding after an edit only re-parses the files that changed. `explore` writes DIR/explore-<node>.html focused on one node and prints its relationships.
 """
 
 from __future__ import annotations
@@ -97,45 +98,90 @@ def write_view(payload: dict, title: str, dest: Path) -> None:
 
 def cmd_build(args) -> None:
     from repo_graph_mcp import fetch as F
+    from repo_graph_mcp import history as H
     from repo_graph_mcp.builder import build_graph
+    from repo_graph_mcp.parsecache import ParseCache
+    from repo_graph_mcp.store import GraphStore
     from repo_graph_mcp.summary import summarize
 
     t0 = time.perf_counter()
     spec = F.parse_repo_spec(args.repo, args.ref, args.path)
+    commits = max(args.history, 0)
+    home = cache_dir()
+    snapshots = H.Snapshots(GraphStore(max_items=4, disk_dir=str(home / "snapshots")))
+    sub = spec.subpath.strip("/")
+
+    def key_for(sha: str) -> str:
+        base = spec.display if spec.kind != "local" else f"local:{Path(spec.local_path).resolve().name}"
+        return f"{base}@{sha[:12]}" + (f":{sub}" if sub else "")
+
+    parse_cache = ParseCache(home / "parses" / f"{slug(spec.display if spec.kind != 'local' else str(Path(spec.local_path).resolve()))}.json.gz")
+    commit_url = (lambda sha: f"{spec.url}/commit/{sha}") if spec.kind == "github" else None
+    cached = False
     work = None
-    if spec.kind == "local":
-        co = F.local_checkout(spec)
-    else:
-        # git clone uses your own git credentials, so private repos work wherever git can see them
-        git_spec = spec if spec.kind == "git" else F.as_git(spec)
-        work = F.new_work_dir()
-        print(f"repo-graph: cloning {spec.display} …", file=sys.stderr)
-        co = F.clone_git(git_spec, work)
-        spec.ref, spec.subpath = git_spec.ref, git_spec.subpath  # /tree/ links are re-split against real branches
+    co = None
+    hist = None
     try:
-        if not co.root.is_dir():
-            raise F.FetchError(f"Path '{spec.subpath}' not found in {spec.display}.")
-        key = f"{spec.display}@{co.sha[:12]}" + (f":{spec.subpath.strip('/')}" if spec.subpath else "")
-        info = {"key": key, "display": spec.display, "name": spec.name or spec.display, "owner": spec.owner,
-                "ref": co.ref, "sha": co.sha, "source": spec.kind, "subpath": spec.subpath.strip("/"),
-                "built_at": int(time.time())}
-        if spec.kind == "github":
-            info["url"] = spec.url
-            info["blob_base"] = f"{spec.url}/blob/{co.sha}/" + (f"{info['subpath']}/" if info["subpath"] else "")
-        g = build_graph(co.root, info)
+        if spec.kind == "local":
+            co = F.local_checkout(spec)
+        else:
+            git_spec = spec if spec.kind == "git" else F.as_git(spec)
+            # the newest commit already built? then nothing needs downloading
+            head = F.remote_head(git_spec) if commits else None
+            spec.ref, spec.subpath = git_spec.ref, git_spec.subpath
+            sub = spec.subpath.strip("/")
+            hist_file = home / "history" / f"{H._safe(key_for(head))}-{commits}.json" if head else None
+            snap = snapshots.get(key_for(head)) if head else None
+            saved = H._read_json(hist_file) if snap is not None else None
+            if snap is not None and saved:
+                g, hist, cached = snap, saved, True
+            else:
+                # git clone uses your own git credentials, so private repos work wherever git can see them
+                work = F.new_work_dir()
+                print(f"repo-graph: cloning {spec.display} …", file=sys.stderr)
+                co = F.clone_git(git_spec, work, depth=commits + 1 if commits else 1)
+                spec.ref, spec.subpath = git_spec.ref, git_spec.subpath  # /tree/ links are re-split against real branches
+                sub = spec.subpath.strip("/")
+        if not cached:
+            if not co.root.is_dir():
+                raise F.FetchError(f"Path '{spec.subpath}' not found in {spec.display}.")
+            key = key_for(co.sha)
+            info = {"key": key, "display": spec.display, "name": spec.name or spec.display, "owner": spec.owner,
+                    "ref": co.ref, "sha": co.sha, "source": spec.kind, "subpath": sub, "built_at": int(time.time())}
+            if spec.kind == "github":
+                info["url"] = spec.url
+                info["blob_base"] = f"{spec.url}/blob/{co.sha}/" + (f"{sub}/" if sub else "")
+
+            def build(folder: Path, inf: dict):
+                return build_graph(folder, inf, parse_cache=parse_cache)
+
+            if commits and H.is_git(co.root):
+                g, hist = H.build_history(co.root, info, key_for, build, snapshots, commits, commit_url,
+                                          log_fn=lambda m: print(f"repo-graph: {m}", file=sys.stderr),
+                                          cache_dir=home / "history")
+                if hist and spec.kind != "local" and not hist["dirty"]:
+                    H._write_json(home / "history" / f"{H._safe(key_for(hist['head']))}-{commits}.json", hist)
+            else:
+                g = build(co.root, info)
+            parse_cache.save()
     finally:
-        if work:
+        if work and co:
             co.cleanup()
     secs = time.perf_counter() - t0
+    key = g.repo.get("key") or key_for(g.repo.get("sha", "local"))
 
-    out = Path(args.out) if args.out else cache_dir() / "graphs" / slug(key)
+    out = Path(args.out) if args.out else home / "graphs" / slug(key)
     out.mkdir(parents=True, exist_ok=True)
     (out / "graph.json").write_text(json.dumps(g.to_json(), separators=(",", ":")), "utf8")
+    if hist:
+        (out / "history.json").write_text(json.dumps(hist, separators=(",", ":")), "utf8")
+    elif (out / "history.json").exists():
+        (out / "history.json").unlink()
     payload = g.to_ui_payload(max_nodes=args.max_nodes)
-    payload.update(graphId=key, mode="repo")
+    payload.update(graphId=key, mode="repo", **({"history": hist} if hist else {}))
     title = f"{spec.display.split('/')[-1]} graph"
     write_view(payload, title, out / "graph.html")
-    summary = summarize(g, None, secs, ui_shown=False, cached=False)
+    summary = summarize(g, None, secs, ui_shown=False, cached=cached, history=hist)
     (out / "summary.txt").write_text(summary, "utf8")
     print(summary)
     print(f"\nInteractive graph: {out / 'graph.html'}")
@@ -170,6 +216,8 @@ def cmd_explore(args) -> None:
           + (f" over {sorted(rels)}" if rels else "") + ".")
     payload = g.to_ui_payload(max_nodes=args.max_nodes, focus=node.id)
     payload.update(graphId=g.repo.get("key", ""), mode="repo", focusDepth=args.depth)
+    if (out / "history.json").exists():
+        payload["history"] = json.loads((out / "history.json").read_text("utf8"))
     dest = out / f"explore-{slug(node.props.get('qualname') or node.name)}.html"
     write_view(payload, f"{node.name} neighbourhood", dest)
     print(f"Interactive view:  {dest}")
@@ -196,6 +244,8 @@ def main() -> None:
     b.add_argument("--path", help="only graph this sub-folder")
     b.add_argument("--out", help="output folder (default: a per-commit folder in the repo-graph cache)")
     b.add_argument("--max-nodes", type=int, default=6000)
+    b.add_argument("--history", type=int, default=8,
+                   help="recent commits to show as changes (default 8; 0 = none). Uncommitted changes always show")
     e = sub.add_parser("explore", help="focus on one node of a built graph")
     e.add_argument("dir")
     e.add_argument("node")

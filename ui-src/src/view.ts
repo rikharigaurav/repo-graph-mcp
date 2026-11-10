@@ -10,6 +10,7 @@ interface Palette {
   edge: Record<Group, string>;
   ink: string; ink2: string; ink3: string; map: string; halo: string;
   regionFill: string; regionStroke: string; regionLabel: string; select: string; onKind: string; warn: string;
+  added: string; changed: string;
 }
 
 const SHAPE_ORDER: Kind[] = [
@@ -122,6 +123,7 @@ export class GraphView {
       this.sim.alpha(this.reducedMotion ? 0 : 0.35).restart();
       if (this.reducedMotion) for (let i = 0; i < 120; i++) this.sim.tick();
     }
+    this.remark();
     this.refreshHighlight();
     this.invalidate(true);
   }
@@ -143,7 +145,7 @@ export class GraphView {
       },
       ink: v("--ink"), ink2: v("--ink-2"), ink3: v("--ink-3"), map: v("--map"), halo: v("--halo"),
       regionFill: v("--region-fill"), regionStroke: v("--region-stroke"), regionLabel: v("--region-label"),
-      select: v("--select"), onKind: v("--on-kind"), warn: v("--warn"),
+      select: v("--select"), onKind: v("--on-kind"), warn: v("--warn"), added: v("--vc-add"), changed: v("--vc-chg"),
     };
     this.invalidate();
   }
@@ -173,19 +175,20 @@ export class GraphView {
     }
     const pad = 36;
     const labelRoom = pts.length < 80 ? 150 : 0; // small graphs show labels to the right of each node
-    const w = this.w - this.inset.right - labelRoom, h = this.h - this.inset.bottom;
+    const left = this.inset.left ?? 0;
+    const w = this.w - this.inset.right - left - labelRoom, h = this.h - this.inset.bottom;
     const k = Math.min(2.4, Math.max(0.05, Math.min((w - pad * 2) / (x1 - x0 || 1), (h - pad * 2) / (y1 - y0 || 1))));
-    const target = { k, tx: w / 2 - ((x0 + x1) / 2) * k, ty: h / 2 - ((y0 + y1) / 2) * k };
+    const target = { k, tx: left + w / 2 - ((x0 + x1) / 2) * k, ty: h / 2 - ((y0 + y1) / 2) * k };
     this.animateTo(target, animate);
   }
 
   /** Space covered by the details panel, so centring targets the part of the map still visible. */
-  inset = { right: 0, bottom: 0 };
+  inset: { right: number; bottom: number; left?: number } = { right: 0, bottom: 0 };
 
   centerOn(n: GNode, minK = 1.6): void {
     this.autoFit = false;
     const k = Math.max(this.k, minK);
-    const cx = (this.w - this.inset.right) / 2, cy = (this.h - this.inset.bottom) / 2;
+    const cx = ((this.inset.left ?? 0) + this.w - this.inset.right) / 2, cy = (this.h - this.inset.bottom) / 2;
     this.animateTo({ k, tx: cx - n.x! * k, ty: cy - n.y! * k }, true);
   }
 
@@ -246,6 +249,34 @@ export class GraphView {
 
   /** Extra nodes to keep lit with the selection: what an opened agent/service/env var broke down into. */
   emphasis: (n: GNode) => GNode[] = () => [];
+
+  /** Version-control marks: what the picked commit (or the uncommitted work) added and changed. */
+  private diff: { added: Set<GNode>; changed: Set<GNode> } | null = null;
+  private marked = new Map<GNode, "added" | "changed">();
+
+  setDiff(d: { added: Set<GNode>; changed: Set<GNode> } | null): void {
+    this.diff = d;
+    this.remark();
+    this.invalidate();
+  }
+
+  /** A change inside something folded shows on the nearest thing on screen (its file, its folder). */
+  private remark(): void {
+    this.marked.clear();
+    if (!this.diff) return;
+    const shown = new Set(this.nodes);
+    const put = (n: GNode, how: "added" | "changed") => {
+      let x: GNode | null = n;
+      while (x && !shown.has(x)) x = x.parent;
+      if (!x) return;
+      const lifted = x !== n;
+      if (!this.marked.has(x) || (this.marked.get(x) === "changed" && how === "added" && !lifted)) {
+        this.marked.set(x, lifted ? "changed" : how);
+      }
+    };
+    for (const n of this.diff.changed) put(n, "changed");
+    for (const n of this.diff.added) put(n, "added");
+  }
 
   private refreshHighlight(): void {
     this.lit.clear();
@@ -393,6 +424,8 @@ export class GraphView {
     ctx.scale(k, k);
     const focus = this.selected ?? this.hovered;
     const dim = !!focus;
+    // with changes picked and nothing selected, everything else steps back so the changes stand out
+    const quiet = !dim && this.marked.size > 0;
 
     this.drawRegions(dim);
 
@@ -401,6 +434,13 @@ export class GraphView {
     for (const g of groups) {
       const ls = this.links.filter((l) => l.group === g && !this.litLinks.has(l));
       if (!ls.length) continue;
+      if (quiet) {
+        const hot = ls.filter((l) => this.marked.has(l.source) || this.marked.has(l.target));
+        const rest = ls.filter((l) => !(this.marked.has(l.source) || this.marked.has(l.target)));
+        if (rest.length) this.strokeLinks(rest, g, baseAlpha(g) * 0.3, false);
+        if (hot.length) this.strokeLinks(hot, g, Math.min(1, baseAlpha(g) * 1.6), false);
+        continue;
+      }
       this.strokeLinks(ls, g, dim ? 0.08 : baseAlpha(g), false);
     }
     if (this.litLinks.size) {
@@ -414,10 +454,31 @@ export class GraphView {
     for (const kind of SHAPE_ORDER) {
       const ns = this.nodes.filter((n) => n.kind === kind);
       if (!ns.length) continue;
-      const faded = dim ? ns.filter((n) => !this.lit.has(n)) : ns;
-      const strong = dim ? ns.filter((n) => this.lit.has(n)) : [];
-      if (faded.length) this.fillShapes(faded, kind, dim ? 0.22 : 1);
+      const keep = (n: GNode) => (dim ? this.lit.has(n) : quiet ? this.marked.has(n) : true);
+      const faded = dim || quiet ? ns.filter((n) => !keep(n)) : ns;
+      const strong = dim || quiet ? ns.filter(keep) : [];
+      if (faded.length) this.fillShapes(faded, kind, dim ? 0.22 : quiet ? 0.32 : 1);
       if (strong.length) this.fillShapes(strong, kind, 1);
+    }
+    if (this.marked.size) {
+      // green ring: added; amber ring: changed (or holds a change, when its contents are folded)
+      for (const how of ["changed", "added"] as const) {
+        ctx.beginPath();
+        let any = false;
+        for (const [n, h] of this.marked) {
+          if (h !== how || n.x === undefined) continue;
+          const rr = hw(n) * 1.08 + 3.2 / k + 1.2;
+          ctx.moveTo(n.x + rr, n.y!);
+          ctx.arc(n.x, n.y!, rr, 0, Math.PI * 2);
+          any = true;
+        }
+        if (!any) continue;
+        ctx.strokeStyle = how === "added" ? pal.added : pal.changed;
+        ctx.lineWidth = 2.2 / k + 0.5;
+        ctx.globalAlpha = dim ? 0.5 : 1;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
     }
     if (this.selected) {
       const n = this.selected;

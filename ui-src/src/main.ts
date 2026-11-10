@@ -4,7 +4,8 @@ import {
   neighbourhood, relPhrase, shapeOf, type GEdge, type GNode, type Group, type Kind, type Payload, type VisState,
 } from "./model";
 import { drawGlyph } from "./icons";
-import { buildOverview, renderOverview, type OvItem } from "./overview";
+import { buildOverview, renderOverview, type OvItem, type Overview, type OverviewHandle } from "./overview";
+import { marksFor, renderChanges, type DiffMarks, type History, type HistoryEntry } from "./changes";
 import { GraphView } from "./view";
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -25,7 +26,11 @@ let lastInput: Record<string, any> = {};
 let focusLabel = "";
 let mode: "overview" | "map" = "map";
 let hasOverview = false;
-let stopOverview: (() => void) | null = null;
+let ovHandle: OverviewHandle | null = null;
+let ovModel: Overview | null = null;
+let history: History | null = null;
+let marks: DiffMarks | null = null;
+let changesOpen = false;
 
 // ── host integration ──────────────────────────────────────────────────────
 function applyHostContext(ctx: HostContext): void {
@@ -132,15 +137,21 @@ function load(payload: Payload): void {
   fitToBudget(model, vis);
   focusLabel = "";
   // the overview is the calm way in; explore results and focused pages open straight on the map
-  stopOverview?.();
+  ovHandle?.destroy();
+  ovHandle = null;
   const ov = buildOverview(model);
+  ovModel = ov;
   hasOverview = payload.mode !== "explore" && ov.itemCount >= 2;
   if (hasOverview) {
-    stopOverview = renderOverview($("#overview"), ov, String(payload.repo?.name ?? model.repoLabel), {
+    ovHandle = renderOverview($("#overview"), ov, String(payload.repo?.name ?? model.repoLabel), {
       glyph: (k, n) => glyph(k, n),
       open: (it) => openItem(it),
     });
   }
+  // version control: open on the uncommitted work when there is some
+  history = ((payload as any).history as History | undefined) ?? null;
+  const working = history?.entries.find((e) => e.kind === "working" && e.diff);
+  marks = working ? marksFor(model, working) : null;
   mode = hasOverview && !payload.focus ? "overview" : "map";
   applyMode();
   renderHeader();
@@ -156,7 +167,9 @@ function load(payload: Payload): void {
   view.select(null);
   view.inset = { right: 0, bottom: 0 };
   closePanel();
+  closeChanges();
   refresh(true);
+  applyMarks();
   const focus = payload.focus ? model.byId.get(payload.focus) : null;
   if (focus && OPENABLE.has(focus.kind) && breakdown(focus).length) vis.opened.add(focus.id); // explore an agent → its breakdown
   if (focus && payload.focusDepth) {
@@ -235,6 +248,118 @@ function refresh(reseed = false): void {
   view.setData(nodes, links, { reseed });
   renderStatus(nodes.length);
   renderLegend();
+}
+
+// ── version control ─────────────────────────────────────────────────────────
+function pickEntry(e: HistoryEntry | null): void {
+  if (!model) return;
+  marks = e ? marksFor(model, e) : null;
+  applyMarks();
+}
+
+/** Put the picked entry's marks on the overview rows and the map, and refresh the chip and panel. */
+function applyMarks(): void {
+  if (!model) return;
+  view?.setDiff(marks ? { added: marks.added, changed: marks.changed } : null);
+  if (ovHandle && ovModel) {
+    const ov = ovModel;
+    if (!marks || !marks.entry.diff) ovHandle.mark(null);
+    else {
+      const counts = new Map<OvItem, [number, number, number]>();
+      const d = marks.entry.diff;
+      const symbolPaths = new Set([...d.added, ...d.changed, ...d.removed]
+        .filter((r) => !/File$/.test(r.l)).map((r) => r.p));
+      ([[d.added, 0], [d.changed, 1], [d.removed, 2]] as const).forEach(([list, i]) => {
+        for (const r of list) {
+          if (/File$/.test(r.l) && i === 1 && symbolPaths.has(r.p)) continue; // its functions say it better
+          const n = model!.byId.get(r.id);
+          const it = (n && ov.itemOf(n)) || ov.itemOfPath(r.p);
+          if (!it) continue;
+          const c = counts.get(it) ?? [0, 0, 0];
+          c[i]++;
+          counts.set(it, c);
+        }
+      });
+      const e = marks.entry;
+      ovHandle.mark(counts, {
+        label: e.kind === "working" ? "uncommitted work" : `${e.short} ${e.title}`,
+        detail: e.summary,
+        onClear: () => pickEntry(null),
+      });
+    }
+  }
+  renderVcChip();
+  if (changesOpen) drawChanges();
+}
+
+function renderVcChip(): void {
+  const chip = $("#vc");
+  chip.hidden = !history;
+  $("#ref").hidden = !!history;
+  if (!history) return;
+  const h = history;
+  chip.replaceChildren();
+  chip.append(el("span", "vc-branch", `${h.branch} @ ${h.short}`));
+  const working = h.entries.find((e) => e.kind === "working");
+  if (working) chip.append(el("span", "vc-badge is-dirty", `● ${working.files.length} uncommitted`));
+  if (h.upstream && h.ahead) chip.append(el("span", "vc-badge is-ahead", `↑${h.ahead} not pushed`));
+  if (!working && !(h.upstream && h.ahead)) chip.append(el("span", "vc-badge", `${h.entries.length} commits`));
+  chip.setAttribute("aria-expanded", String(changesOpen));
+  chip.title = "Uncommitted changes and recent commits";
+}
+
+function drawChanges(): void {
+  if (!model || !history) return;
+  const host = $("#changes");
+  renderChanges(host, history, model, marks, {
+    glyph: (k, n) => glyph(k, n),
+    pick: (e) => pickEntry(e),
+    openNode: (n) => { setMode("map"); select(n, true); },
+    openLink: (url) => void openLink(url),
+    close: () => closeChanges(),
+    showInMap: () => showChangesInMap(),
+  });
+}
+
+function openChanges(): void {
+  if (!history) return;
+  changesOpen = true;
+  const narrow = window.matchMedia("(max-width: 640px)").matches;
+  if (narrow) closePanel();
+  $("#changes").hidden = false;
+  $("#app").classList.toggle("changes-open", !narrow);
+  if (view && !narrow) view.inset = { ...view.inset, left: 360 };
+  drawChanges();
+  renderVcChip();
+}
+
+function closeChanges(): void {
+  changesOpen = false;
+  $("#changes").hidden = true;
+  $("#app").classList.remove("changes-open");
+  if (view) view.inset = { ...view.inset, left: 0 };
+  if (history) renderVcChip();
+}
+
+/** The map, narrowed to what the picked entry touched and what touches it. */
+function showChangesInMap(): void {
+  if (!model || !vis || !marks) return;
+  const touched = [...marks.added, ...marks.changed];
+  if (!touched.length) return;
+  const keep = new Set<string>();
+  for (const n of touched) {
+    keep.add(n.id);
+    for (const e of [...n.outE, ...n.inE]) if (e.group !== "contains") { keep.add(e.s.id); keep.add(e.t.id); }
+    if (n.fileOf) vis.expanded.add(n.fileOf.id);
+  }
+  for (const n of marks.affected) keep.add(n.id);
+  for (const id of [...keep]) for (let a = model.byId.get(id)?.parent; a; a = a.parent) { keep.add(a.id); vis.collapsed.delete(a.id); }
+  vis.focus = keep;
+  focusLabel = marks.entry.kind === "working" ? "uncommitted changes" : `changes in ${marks.entry.short}`;
+  setMode("map");
+  select(null, false);
+  renderHeader();
+  refresh(true);
 }
 
 // ── overview ⇄ map ────────────────────────────────────────────────────────
@@ -451,7 +576,7 @@ function select(n: GNode | null, center: boolean): void {
   const panel = $("#panel").getBoundingClientRect();
   const stage = $("#canvas").getBoundingClientRect();
   const sheet = panel.width > stage.width * 0.8; // narrow layout: panel is a bottom sheet
-  view.inset = sheet ? { right: 0, bottom: panel.height + 8 } : { right: panel.width + 10, bottom: 0 };
+  view.inset = sheet ? { right: 0, bottom: panel.height + 8 } : { right: panel.width + 10, bottom: 0, left: view.inset.left };
   if (center) view.centerOn(n);
   if (bridge.connected && bridge.hostCapabilities.updateModelContext) {
     const where = n.path ? ` in ${n.path}${n.props.line ? `:${n.props.line}` : ""}` : "";
@@ -680,7 +805,7 @@ function panelHeader(): HTMLElement {
 
 function closePanel(): void {
   $("#panel").hidden = true;
-  if (view) view.inset = { right: 0, bottom: 0 };
+  if (view) view.inset = { right: 0, bottom: 0, left: view.inset.left };
 }
 
 function focusOn(n: GNode, depth = 1): void {
@@ -801,6 +926,7 @@ function wire(): void {
   $("#zoom-out").onclick = () => view?.zoomBy(1 / 1.3);
   $("#scope-reset").onclick = () => void showAll();
   $("#scope-overview").onclick = () => setMode("overview");
+  $("#vc").onclick = () => (changesOpen ? closeChanges() : openChanges());
   document.querySelectorAll<HTMLButtonElement>("#modes button").forEach((b) => {
     b.onclick = () => setMode(b.dataset.mode as "overview" | "map");
   });

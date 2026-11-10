@@ -19,8 +19,10 @@ import hmac
 import importlib.resources
 import logging
 import os
+import re
 import sys
 import time
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import anyio
@@ -33,7 +35,9 @@ from pydantic import Field
 from . import __version__
 from . import fetch as F
 from . import graph as G
+from . import history as H
 from .builder import build_graph
+from .parsecache import ParseCache
 from .store import GraphStore
 from .summary import summarize
 
@@ -41,6 +45,9 @@ log = logging.getLogger("repo_graph_mcp")
 
 VIEW_URI = "ui://repo-graph/graph-view.html"
 UI_MAX_NODES = int(os.getenv("REPO_GRAPH_UI_MAX_NODES", "6000"))
+HISTORY_COMMITS = int(os.getenv("REPO_GRAPH_HISTORY", "8"))  # recent commits shown as changes; 0 = off
+HISTORIES: dict[str, dict[str, Any]] = {}  # graph id -> uncommitted changes and recent commits
+_PARSE_CACHES: dict[str, ParseCache] = {}
 BUILD_SLOTS = asyncio.Semaphore(int(os.getenv("REPO_GRAPH_MAX_CONCURRENT_BUILDS", "2")))
 store = GraphStore()
 
@@ -59,6 +66,9 @@ Tools for turning a code repository into a structural graph and showing it in th
   (LLM providers, vector/graph DBs, databases, queues, cloud SDKs, known APIs) and env vars it reads. Ask
   `explore_graph` about an agent, a service (direction 'in' = the code that uses it) or an env var; each
   link cites the file:line it was found on. Infrastructure files and cloud-console settings aren't read.
+- For a local folder or a git clone, the summary's `Version control:` block lists the uncommitted
+  changes and the last commits as graph changes (added/changed/removed functions, endpoints, services),
+  and which commits aren't pushed; the view shows them on a timeline.
 - Graphs are cached per commit, so calling again for the same repo is instant.
 Only Python and JavaScript/TypeScript are parsed into functions/classes/calls; other languages appear as
 files. Links are resolved statically, so dynamic dispatch and reflection are not followed.
@@ -122,8 +132,11 @@ async def obtain_graph(repo: str, ref: str | None, path: str | None, refresh: bo
     if spec.kind == "local":
         co = F.local_checkout(spec)
         key = _key(spec, co.sha + ("-dirty" if co.ref.endswith("*") else ""))
-        g = await anyio.to_thread.run_sync(lambda: build_graph(co.root, _repo_info(spec, co, key)))
+        info = _repo_info(spec, co, key)
+        g, hist = await anyio.to_thread.run_sync(lambda: _with_history(co.root, spec, info, None))
         store.put(key, g, persist=False)
+        if hist:
+            HISTORIES[key] = hist
         return key, g, time.perf_counter() - t0, False
 
     if spec.kind == "github":
@@ -161,7 +174,8 @@ async def _via_git(spec: F.RepoSpec, display_spec: F.RepoSpec, refresh: bool, pr
     async with BUILD_SLOTS:
         await progress(0.15, f"Cloning {display_spec.display}")
         work = F.new_work_dir()
-        co = await anyio.to_thread.run_sync(lambda: F.clone_git(spec, work))
+        depth = HISTORY_COMMITS + 1 if HISTORY_COMMITS else 1
+        co = await anyio.to_thread.run_sync(lambda: F.clone_git(spec, work, depth=depth))
         display_spec.ref, display_spec.subpath = spec.ref, spec.subpath  # /tree/ link re-split by clone_git
         try:
             key = _key(display_spec, co.sha)
@@ -171,7 +185,10 @@ async def _via_git(spec: F.RepoSpec, display_spec: F.RepoSpec, refresh: bool, pr
             info = _repo_info(display_spec, co, key)
             if display_spec.kind == "github":
                 info["source"] = "github (git clone)"
-            g = await anyio.to_thread.run_sync(lambda: build_graph(co.root, info))
+            url = (lambda sha: f"{display_spec.url}/commit/{sha}") if display_spec.kind == "github" else None
+            g, hist = await anyio.to_thread.run_sync(lambda: _with_history(co.root, display_spec, info, url))
+            if hist:
+                HISTORIES[key] = hist
         finally:
             co.cleanup()
     store.put(key, g)
@@ -186,8 +203,34 @@ async def find_graph(graph: str, ctx: Context | None) -> tuple[str, G.CodeGraph]
     return key, g
 
 
+def _with_history(root, spec: F.RepoSpec, info: dict[str, Any], commit_url) -> tuple[G.CodeGraph, dict | None]:
+    """Build, adding uncommitted changes and recent commits when `root` is a git checkout."""
+    cache_base = os.getenv("REPO_GRAPH_CACHE_DIR")
+    pc_key = spec.display if spec.kind != "local" else str(spec.local_path)
+    pc = _PARSE_CACHES.get(pc_key)
+    if pc is None:
+        path = Path(cache_base) / "parses" / (re.sub(r"[^A-Za-z0-9_.@-]+", "_", pc_key)[:120] + ".json.gz") if cache_base else None
+        pc = _PARSE_CACHES[pc_key] = ParseCache(path)
+
+    def build(folder, inf):
+        return build_graph(folder, inf, parse_cache=pc)
+
+    try:
+        if HISTORY_COMMITS and H.is_git(root):
+            g, hist = H.build_history(root, info, lambda sha: _key(spec, sha), build, H.Snapshots(store),
+                                      HISTORY_COMMITS, commit_url,
+                                      cache_dir=Path(cache_base) / "history" if cache_base else None)
+            g.repo["key"] = info["key"]
+            return g, hist
+        return build(root, info), None
+    finally:
+        pc.save()
+
+
 def _payload(key: str, g: G.CodeGraph, focus: str | None = None, mode: str = "repo") -> dict[str, Any]:
     p = g.to_ui_payload(max_nodes=UI_MAX_NODES, focus=focus)
+    if key in HISTORIES:
+        p["history"] = HISTORIES[key]
     p["graphId"] = key
     p["mode"] = mode
     return p
@@ -228,7 +271,7 @@ async def graph_repo(
         return _error(str(e))
     except httpx.HTTPError as e:
         return _error(f"Network error while fetching the repository: {e}")
-    text = summarize(g, key, secs, ui_shown=client_supports_apps(ctx), cached=cached)
+    text = summarize(g, key, secs, ui_shown=client_supports_apps(ctx), cached=cached, history=HISTORIES.get(key))
     return CallToolResult(content=[TextContent(type="text", text=text)], structured_content=_payload(key, g))
 
 

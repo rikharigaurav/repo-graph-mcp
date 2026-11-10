@@ -20,7 +20,20 @@ export interface OvItem {
 export interface OvSection { title?: string; items: OvItem[] }
 export interface OvColumn { key: ColKey; title: string; sub: string; sections: OvSection[] }
 export interface OvLink { from: OvItem; to: OvItem; group: Group; count: number }
-export interface Overview { columns: OvColumn[]; links: OvLink[]; itemCount: number }
+export interface Overview {
+  columns: OvColumn[];
+  links: OvLink[];
+  itemCount: number;
+  /** The row a node is counted under (its folder group, its endpoint, its agent…). */
+  itemOf(n: GNode): OvItem | null;
+  /** The folder row a path falls in: for things that no longer exist in this graph. */
+  itemOfPath(path: string): OvItem | null;
+}
+export interface OverviewHandle {
+  destroy(): void;
+  /** Change counts per row ([added, changed, removed]) and the banner saying what they're from. */
+  mark(counts: Map<OvItem, [number, number, number]> | null, banner?: { label: string; detail: string; onClear(): void }): void;
+}
 
 const CODE = new Set<Kind>(["DataFile", "TemplateMarkupFile"]);
 const UI_EXT = /\.(tsx|jsx|vue|svelte|html?|astro)$/i;
@@ -220,7 +233,18 @@ export function buildOverview(m: Model): Overview {
     else agg.set(key, { from: a, to: b, group: e.group, count: e.count });
   }
   const itemCount = columns.reduce((s, c) => s + c.sections.reduce((t, x) => t + x.items.length, 0), 0);
-  return { columns, links: [...agg.values()], itemCount };
+  const keys = [...groups.keys()].sort((a, b) => b.length - a.length);
+  const itemOfPath = (path: string): OvItem | null => {
+    if (/(^|\/)(tests?|__tests__|spec)\//.test(path) && testsItem) return testsItem;
+    for (const k of keys) {
+      if (k === "" ? !path.includes("/") || keys.length === 1 : path === k || path.startsWith(k + "/")) {
+        const first = groups.get(k)?.[0];
+        if (first) return fileItem.get(first) ?? null;
+      }
+    }
+    return null;
+  };
+  return { columns, links: [...agg.values()], itemCount, itemOf, itemOfPath };
 }
 
 function capped(col: ColKey, nodes: GNode[], describe: (n: GNode) => Partial<OvItem>, noun: string,
@@ -251,7 +275,7 @@ const LINK_WORD: Record<string, [string, string]> = {
   http: ["request", "requests"], calls: ["call", "calls"], uses: ["use", "uses"], runs: ["link", "links"],
 };
 
-export function renderOverview(host: HTMLElement, ov: Overview, repoName: string, cb: OverviewCallbacks): () => void {
+export function renderOverview(host: HTMLElement, ov: Overview, repoName: string, cb: OverviewCallbacks): OverviewHandle {
   const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string) => {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -267,7 +291,9 @@ export function renderOverview(host: HTMLElement, ov: Overview, repoName: string
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.classList.add("ov-links");
   svg.setAttribute("aria-hidden", "true");
-  board.append(intro, grid, svg);
+  const banner = el("div", "ov-banner");
+  banner.hidden = true;
+  board.append(banner, intro, grid, svg);
 
   const rowEl = new Map<OvItem, HTMLElement>();
   const colIndex = new Map<ColKey, number>(ov.columns.map((c, i) => [c.key, i]));
@@ -430,5 +456,32 @@ export function renderOverview(host: HTMLElement, ov: Overview, repoName: string
   ro.observe(board);
   requestAnimationFrame(layout);
   (document as any).fonts?.ready?.then(() => layout());
-  return () => ro.disconnect();
+
+  function mark(counts: Map<OvItem, [number, number, number]> | null, info?: { label: string; detail: string; onClear(): void }): void {
+    for (const [item, row] of rowEl) {
+      row.querySelector(".ov-diff")?.remove();
+      const c = counts?.get(item);
+      row.classList.toggle("has-added", !!c && c[0] > 0 && c[1] === 0 && c[2] === 0);
+      row.classList.toggle("has-diff", !!c);
+      if (!c) continue;
+      const tag = el("span", "ov-diff");
+      if (c[0]) tag.append(el("span", "vc-add", `+${c[0]}`));
+      if (c[1]) tag.append(el("span", "vc-chg", `~${c[1]}`));
+      if (c[2]) tag.append(el("span", "vc-del", `−${c[2]}`));
+      row.insertBefore(tag, row.querySelector(".ov-meta"));
+    }
+    board.classList.toggle("is-marked", !!counts?.size);
+    banner.hidden = !info;
+    banner.replaceChildren();
+    if (info) {
+      const text = el("span", "ov-banner-text");
+      text.append("Changes from ", el("strong", "", info.label), ` · ${info.detail}`);
+      const clear = el("button", "link-btn", "Clear");
+      clear.type = "button";
+      clear.onclick = () => info.onClear();
+      banner.append(text, clear);
+    }
+    requestAnimationFrame(layout);
+  }
+  return { destroy: () => ro.disconnect(), mark };
 }
