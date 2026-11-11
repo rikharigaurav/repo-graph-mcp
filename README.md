@@ -2,7 +2,9 @@
 
 Share a repository with Claude and get its **code-structure graph** back: folders, files, classes,
 functions and API endpoints, with the calls, imports, tests and HTTP requests between them, as an
-interactive map you can pan, search, filter and click through.
+interactive map you can pan, search, filter and click through. A **GenAI & services** layer sits beside
+the code: the AI agents in it (and their steps and tools), MCP servers, the LLMs, vector/graph databases
+and other services it calls, and the env vars it reads, each linked to the functions behind it.
 
 It's the graph half of [Read-Code-Structure](https://github.com/rikharigaurav/Read-Code-Structure),
 packaged as a Claude plugin. It makes no LLM summaries and no embeddings, so a typical repo is graphed in
@@ -14,6 +16,12 @@ It runs two ways:
   browser from Claude Code. All you need is Python 3.10+ and git.
 - **MCP mode** (optional). A small server renders the graph inside the chat itself, as an MCP App. You
   can run it locally or host it once for claude.ai on web and mobile.
+
+![The overview: frontend, API, backend and AI & services, with the links between them](docs/graph-overview.png)
+
+It opens on an **overview**: the repo as four calm columns (Frontend → API → Backend → AI & services) with
+bundled arrows between them. Hover a row to see what it talks to; click it to open just that part as an
+interactive graph. The full map is one click away.
 
 ![The graph of Read-Code-Structure rendered inside the chat](docs/graph-view.png)
 
@@ -53,6 +61,98 @@ the same database. It adds a few that are free to compute:
 | `TEST` | test file → functions and endpoints it exercises (`client.get('/users/42')` matches `/users/{id}`) |
 | `GET` · `POST` · … | client code (`fetch`, axios, requests/httpx, generated API clients) → the endpoint it hits, including through proxy prefixes like `/api` or `/api/v1` |
 
+### GenAI & services layer
+
+![Double-clicking an agent breaks it down into its numbered steps and the functions they run](docs/graph-view-genai.png)
+
+Found by the same static pass (Python via `ast`, JS/TS via the parse plus targeted patterns) and grouped
+under one `GenAI` hub node, so the view shows it as its own territory. Every link records the `file`
+and `line` it came from and a `basis`: `declared` when the code says it outright, `inferred` when it
+follows a value (a call on an object built from an SDK client).
+
+| Nodes | |
+|---|---|
+| `Agent` | LangGraph `StateGraph` / `MessageGraph` (Python and LangGraph.js), prebuilt agents (`create_react_agent`, `create_supervisor`, `create_deep_agent`, `AgentExecutor`…) and framework agents (`Agent(...)` from the OpenAI Agents SDK, PydanticAI, CrewAI, smolagents, AutoGen, Google ADK, LlamaIndex…) |
+| `AgentStep` | one node of an agent's graph, numbered in the order it was added, with its entry and END flags |
+| `McpServer` | `FastMCP(...)` / low-level `Server(...)` (and `McpServer` in TypeScript) with the tools, resources and prompts registered on it |
+| `ExternalService` | LLM providers, vector DBs, graph DBs, databases, caches, queues, cloud SDKs, payments, auth/backends and well-known APIs: from SDK imports, client objects, `"provider:model"` strings and URLs like `https://api.github.com/…` |
+| `EnvVar` | `os.getenv`, `os.environ[...]`, pydantic `BaseSettings` fields (with `env_prefix` and aliases), `process.env`, `import.meta.env`; marked required / has a default / optional, and flagged when a secret-looking name has a browser prefix such as `NEXT_PUBLIC_` |
+
+| Relationships | |
+|---|---|
+| `NEXT` | step → step (`kind`: `edge`, `conditional` via a router, or `goto` from `Command(goto=…)`) |
+| `RUNS` · `ROUTES` | step → the function (or sub-agent) it runs · step → the router function that decides where it goes next |
+| `USES_TOOL` | agent, `ToolNode` step or a function calling `bind_tools` → tool functions (`@tool`, `@function_tool`, tool lists, even when the list lives in another module) |
+| `EXPOSES` | MCP server → the functions behind `@mcp.tool()`, `@mcp.resource(...)`, `@mcp.prompt()` |
+| `USES` | function → service it calls, including through a client imported from another module |
+| `READS_ENV` | function / settings class → env var |
+
+Code under `docs/`, `examples/`, test folders and migrations isn't scanned for this layer, and nothing
+outside the repository (cloud consoles, deployed config) can be seen. Infrastructure files (compose,
+Kubernetes, Terraform) are left to tools built for them.
+
+### Version control: uncommitted work and recent commits
+
+![Picking a commit marks what it added and changed on the overview](docs/graph-changes.png)
+
+When the repo is a git checkout (a local folder, or a GitHub repo cloned with some history), the graph
+also shows **what changed**, as graph changes rather than line diffs:
+
+- **Uncommitted changes** on top of the last commit: functions added, changed and removed, new
+  endpoints, services, agents and env vars, and the callers of changed code that may need a look.
+- **The last 8 commits** (`--history N`), each against its parent, with author, time, a link to the
+  commit on GitHub, and whether it's **pushed** to the upstream branch (`origin/main`) yet.
+
+The header shows `main @ 1381b9f · ● 2 uncommitted · ↑2 not pushed`; click it for the timeline. Picking an
+entry puts `+2 ~3 −1` on the overview rows it touched and rings the changed nodes on the map (green
+added, amber changed); "Show these in the map" narrows the map to them.
+
+**It's fast because nothing is built twice.** Each commit's graph is saved by its SHA, and each file's
+parse by a hash of its bytes, in the repo-graph cache folder:
+
+| Situation | What happens | Typical time |
+|---|---|---|
+| Clean checkout, built before | load the saved graph of HEAD | ~0.1 s |
+| You (or Claude) edited files | rebuild, parsing only the edited files | under 1 s |
+| New commit | build that commit only; older ones come from the cache | under 1 s |
+| GitHub repo, no new commits | `git ls-remote` only, no clone | under 1 s |
+
+Old commits are read with `git archive` into a temporary folder: the repository is never modified and
+nothing is fetched from the network for local repos.
+
+### Live view: watch the graph change while Claude Code works
+
+![The Live tab: each change as it happens, labelled with the Claude Code tool that made it](docs/graph-live.png)
+
+Point it at a local folder and keep the page open beside Claude Code:
+
+```
+python skills/graph-repo/scripts/graph_repo.py live <folder> --open
+```
+
+or just ask Claude: "show me the live graph of this repo". It serves the view on
+`http://127.0.0.1:7333/` and opens on a **Live** tab next to Overview and Map:
+
+- every change appears within a second or two: what it added, changed and removed (functions, endpoints,
+  services, env vars) and which files it touched;
+- edits Claude Code makes are labelled **Claude Code · Edit** (or Write, MultiEdit, NotebookEdit); other
+  edits show as **File change**, and commits as **Commit**;
+- "Since you started watching" sums up the whole session; the overview rows a change touched light up,
+  and the map rings its nodes. Turn off "Show each new change as it arrives" to stay on one change;
+- the graph updates in place: your tab, filters, folds, focus and selection stay as they were.
+
+How it works: the server checks the folder's files (size and modification time) every second, waits for a
+burst of writes to finish, rebuilds the graph (only changed files are parsed again, so this takes well
+under a second) and pushes the difference to the page. The plugin's `PostToolUse` hook
+(`hooks/hooks.json`) tells the server which file Claude just edited, which is how changes get Claude
+Code's label and show up without waiting for the next check. With no live view running, the hook does
+nothing.
+
+It listens on 127.0.0.1 only, answers only requests addressed to localhost, and the hook needs a token
+from a lock file in your cache folder. Stop it with Ctrl+C or `live <folder> --stop`; it also stops by
+itself after 2 hours with no tab open (`--idle-minutes`). Running `live` again for the same folder reuses
+the server that's already running.
+
 ## MCP tools (MCP mode)
 
 | Tool | Shown to | What it does |
@@ -64,12 +164,17 @@ the same database. It adds a few that are free to compute:
 | `push_graph_to_neo4j` | model | Only when `NEO4J_URI` is set: write the graph into Neo4j (ids namespaced per repo) |
 
 The graph itself goes to the view as `structuredContent`, which MCP Apps hosts keep out of the model's
-context. Claude gets a compact summary instead (layout, endpoints and who calls them, most-called
-functions, most-imported files, test reach) and uses `explore_graph`/`search_graph` to dig further.
+context. Claude gets a compact summary instead (layout, endpoints and who calls them, agents and their
+flow, MCP servers, services, env vars and any leaked browser secrets, most-called functions, most-imported
+files, test reach) and uses `explore_graph`/`search_graph` to dig further.
 
 In the view you can:
+- start from the overview: hover a folder, endpoint, agent or service to light up its links, click it to
+  open only that part as a graph (big folders open as files first), and switch with Overview / Map;
 - click a node for its details and relationships; every entry is clickable;
 - double-click a file to show its functions, or a folder to fold or unfold it;
+- double-click an agent to break it down into its numbered steps, the functions they run, routers and tools;
+  a service to show the code that uses it; an MCP server for what it exposes; an env var for where it's read;
 - search with `/`, zoom with ctrl/⌘ + scroll (plain scroll once you've clicked into the map), and fit with `0`;
 - toggle node and link kinds in the legend;
 - in MCP mode, use "Ask Claude about this" to send the selection back to the chat.
@@ -88,8 +193,8 @@ In Claude Code:
 
 In the Claude app, add the marketplace `rikharigaurav/repo-graph-mcp` and install `repo-graph`.
 
-That's all. The plugin contains only a skill (`graph-repo`), an agent (`repo-grapher`) and the bundled
-builder, so there's no server to start. You need Python 3.10+ and git wherever Claude runs code. On first
+That's all. The plugin contains a skill (`graph-repo`), an agent (`repo-grapher`), the bundled builder and
+one hook that feeds the optional live view, so there's no server to start. You need Python 3.10+ and git wherever Claude runs code. On first
 use the builder installs tree-sitter into a private environment in your cache folder
 (`%LOCALAPPDATA%\repo-graph` on Windows, `~/.cache/repo-graph` elsewhere), never into your global Python.
 
@@ -180,6 +285,8 @@ Hosted mode never reads paths on the server's own disk unless you set `REPO_GRAP
 | `REPO_GRAPH_MAX_FILE_KB` | `768` | Larger files are skipped |
 | `REPO_GRAPH_MAX_DOWNLOAD_MB` | `300` | Archive size limit |
 | `REPO_GRAPH_UI_MAX_NODES` | `6000` | Nodes sent to the view (most structural first) |
+| `REPO_GRAPH_HISTORY` | `8` | Recent commits shown as changes (`0` turns history off) |
+| `REPO_GRAPH_HOME` | user cache folder | Agent mode: where commit snapshots, parse cache and history are kept |
 | `REPO_GRAPH_MAX_CONCURRENT_BUILDS` | `2` | Parallel builds in hosted mode |
 | `REPO_GRAPH_AUTH_TOKEN` | – | HTTP mode: require `Authorization: Bearer …` or `?key=…` |
 | `REPO_GRAPH_ALLOWED_HOSTS` | – | HTTP mode: enable DNS-rebinding protection for these hostnames |
@@ -195,7 +302,8 @@ repo's nodes.
 
 ## How it works
 
-1. **Fetch**: agent mode runs `git clone --depth 1` with your own credentials. MCP mode first resolves
+1. **Fetch**: agent mode runs `git clone --depth <history + 1>` with your own credentials (after a
+   `git ls-remote` that skips the clone when that commit is already cached). MCP mode first resolves
    the commit SHA (one small GitHub API call) and stops there on a cache hit; otherwise it downloads the
    tarball and extracts it, skipping `node_modules`, build output, VCS folders and oversized files.
    `/tree/<branch>/<folder>` links are matched against the real branch names, so branches containing
@@ -206,7 +314,13 @@ repo's nodes.
 4. **Resolve**: module index (Python packages, relative imports, tsconfig paths), then calls, inheritance,
    tests and HTTP links. An edge is only added when its target is actually defined in the repo; there is
    no fuzzy name matching.
-5. **Deliver**: summary to the model, graph to the view, cached by commit.
+5. **GenAI layer** (`genai.py`): agents, tools, MCP servers, services and env vars, linked to the nodes
+   resolved above, in two passes so clients built in one module are followed where they're imported.
+6. **Version control** (`history.py`, `parsecache.py`): in a git checkout, the uncommitted changes and
+   the last N commits as graph diffs; graphs saved per commit SHA, parses per file content hash.
+7. **Deliver**: summary to the model, graph to the view, cached by commit.
+8. **Live** (`live.py`, optional): a local server that rebuilds on every change and streams the
+   difference to the view (Server-Sent Events); Claude Code's hook labels the changes Claude made.
 
 Limits: only Python and JS/TS are parsed into symbols (other languages show as files). Dynamic dispatch,
 dependency injection and reflection aren't followed. Route matching is static, so routes built at

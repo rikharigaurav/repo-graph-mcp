@@ -28,8 +28,18 @@ FUNCTION = "Function"
 CLASS = "Class"
 ENDPOINT = "ApiEndpoint"
 
+# GenAI layer (genai.py): one hub node groups what the app is built on
+GENAI = "GenAI"  # hub
+AGENT = "Agent"  # a LangGraph graph, a prebuilt agent or a framework Agent(...)
+AGENT_STEP = "AgentStep"  # one node of an agent's graph
+MCP_SERVER = "McpServer"
+SERVICE = "ExternalService"  # LLM provider, vector/graph DB, database, queue, cloud SDK…
+ENV_GROUP = "EnvGroup"
+ENV_VAR = "EnvVar"
+
 FILE_LABELS = (SOURCE_FILE, TEST_FILE, DOC_FILE, TEMPLATE_FILE)
-ALL_LABELS = (FOLDER, *FILE_LABELS, CLASS, FUNCTION, ENDPOINT)
+GENAI_LABELS = (GENAI, AGENT, AGENT_STEP, MCP_SERVER, SERVICE, ENV_GROUP, ENV_VAR)
+ALL_LABELS = (FOLDER, *FILE_LABELS, CLASS, FUNCTION, ENDPOINT, *GENAI_LABELS)
 
 BELONGS_TO = "BELONGS_TO"
 CALLS = "CALLS"
@@ -37,6 +47,14 @@ IMPORTS = "IMPORTS"
 TEST = "TEST"
 EXTENDS = "EXTENDS"
 HTTP_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "ANY")
+NEXT = "NEXT"  # agent step -> step (props: kind edge|conditional|goto)
+RUNS = "RUNS"  # agent step -> function / sub-agent it executes
+ROUTES = "ROUTES"  # agent step -> router function deciding where to go next
+USES_TOOL = "USES_TOOL"  # agent / step / function binding tools -> tool function
+EXPOSES = "EXPOSES"  # MCP server -> tool / resource / prompt function
+USES = "USES"  # code -> external service
+READS_ENV = "READS_ENV"  # code -> env var
+GENAI_RELS = (NEXT, RUNS, ROUTES, USES_TOOL, EXPOSES, USES, READS_ENV)
 
 
 @dataclass
@@ -111,8 +129,8 @@ class CodeGraph:
         truncated = False
         if len(node_ids) > max_nodes:
             truncated = True
-            rank = {FOLDER: 0, ENDPOINT: 1, SOURCE_FILE: 2, TEST_FILE: 3, TEMPLATE_FILE: 4,
-                    DOC_FILE: 5, CLASS: 6, FUNCTION: 7}
+            rank = {FOLDER: 0, **{lbl: 0 for lbl in GENAI_LABELS}, ENDPOINT: 1, SOURCE_FILE: 2, TEST_FILE: 3,
+                    TEMPLATE_FILE: 4, DOC_FILE: 5, CLASS: 6, FUNCTION: 7}
             degree = Counter()
             for s, t, r, _ in self.edges:
                 if r != BELONGS_TO:
@@ -124,7 +142,9 @@ class CodeGraph:
                 node_ids[-1] = focus
         keep = set(node_ids)
         edges = [
-            {"s": s, "t": t, "r": r, **({"c": p["count"]} if p.get("count", 1) > 1 else {})}
+            {"s": s, "t": t, "r": r, **({"c": p["count"]} if p.get("count", 1) > 1 else {}),
+             **({"x": {k: p[k] for k in ("line", "file", "how", "basis", "kind", "mode") if p.get(k) not in (None, "")}}
+                if r in GENAI_RELS else {})}
             for s, t, r, p in self.edges
             if s in keep and t in keep
         ]
@@ -260,14 +280,30 @@ class CodeGraph:
                 loc += f"-{node.props['end_line']}"
         if loc:
             lines.append(f"  location: {loc}")
-        for key in ("signature", "http_method", "route", "framework", "test_framework", "language", "loc", "summary"):
-            if node.props.get(key):
-                lines.append(f"  {key}: {node.props[key]}")
+        for key in ("signature", "http_method", "route", "framework", "category", "ai_tool", "tool_name", "runs",
+                    "flow", "entry", "test_framework", "language", "loc", "summary", "sdks", "tools_unresolved",
+                    "unresolved", "required", "browser_exposed", "warning"):
+            val = node.props.get(key)
+            if val not in (None, "", [], False):
+                lines.append(f"  {key}: {', '.join(map(str, val)) if isinstance(val, list) else val}")
+        if node.label == AGENT:  # the flow, step by step, with the code each step runs
+            steps = sorted((self.nodes[x] for x, r in self.in_adj.get(node.id, []) if r == BELONGS_TO
+                            and self.nodes[x].label == AGENT_STEP), key=lambda n: n.props.get("order", 0))
+            for st in steps:
+                runs = [self._short(t) + self._where(st.id, t, r) for t, r in self.out_adj.get(st.id, [])
+                        if r in (RUNS, USES_TOOL, ROUTES)]
+                nxt = [self.nodes[t].name + ("?" if self._edges[(st.id, t, r)].get("kind") != "edge" else "")
+                       for t, r in self.out_adj.get(st.id, []) if r == NEXT]
+                if st.props.get("can_end"):
+                    nxt.append("END")
+                lines.append(f"  step {st.props.get('order')}. {st.name}" + (" (entry)" if st.props.get("entry") else "")
+                             + (f" runs {'; '.join(runs)}" if runs else (f" runs {st.props['runs']} (not in the graph)" if st.props.get("runs") else ""))
+                             + (f" -> {', '.join(nxt)}" if nxt else ""))
         groups: dict[str, list[str]] = defaultdict(list)
         for t, r in self.out_adj.get(node.id, []):
-            groups[f"-[{r}]->"].append(self._short(t))
+            groups[f"-[{r}]->"].append(self._short(t) + self._where(node.id, t, r))
         for s, r in self.in_adj.get(node.id, []):
-            groups[f"<-[{r}]-"].append(self._short(s))
+            groups[f"<-[{r}]-"].append(self._short(s) + self._where(s, node.id, r))
         for key in sorted(groups):
             vals = groups[key]
             more = f" … +{len(vals) - max_per_rel} more" if len(vals) > max_per_rel else ""
@@ -278,9 +314,23 @@ class CodeGraph:
         n = self.nodes[nid]
         if n.label in (FUNCTION, CLASS):
             return f"{n.props.get('qualname', n.name)} ({n.path})"
-        if n.label == ENDPOINT:
+        if n.label == ENDPOINT or n.label in GENAI_LABELS:
             return n.name
         return n.path or n.name
+
+    def _where(self, s: str, t: str, rel: str) -> str:
+        """Provenance for GenAI links: the line the link was found on and what it's based on."""
+        if rel not in GENAI_RELS:
+            return ""
+        p = self._edges.get((s, t, rel), {})
+        bits = []
+        if p.get("line"):
+            bits.append(f"{p.get('file') or ''}:{p['line']}".lstrip(":") if p.get("file") else f"line {p['line']}")
+        if p.get("how"):
+            bits.append(str(p["how"]))
+        if p.get("kind") and rel == NEXT:
+            bits.append(str(p["kind"]))
+        return f" [{'; '.join(bits)}]" if bits else ""
 
 
 def _label_priority(n: Node) -> int:

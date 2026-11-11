@@ -1,9 +1,15 @@
 import { Bridge, type CallToolResult, type HostContext } from "./bridge";
 import {
-  KINDS, KIND, LINK_GROUPS, Model, SINGULAR, computeVisible, isFile, neighbourhood, relPhrase,
-  type GNode, type Group, type Kind, type Payload, type VisState,
+  KINDS, KIND, LINK_GROUPS, Model, NESTED_KINDS, OPENABLE, SINGULAR, breakdown, computeVisible, isFile, isGenAI,
+  neighbourhood, relPhrase, shapeOf, type GEdge, type GNode, type Group, type Kind, type Payload, type VisState,
 } from "./model";
-import { GraphView, shapePath } from "./view";
+import { drawGlyph } from "./icons";
+import { buildOverview, renderOverview, type OvItem, type Overview, type OverviewHandle } from "./overview";
+import { marksFor, renderChanges, type DiffMarks, type History, type HistoryEntry } from "./changes";
+import {
+  connectLive, fetchGraph, labelOf as liveLabel, renderLive, tickTimes, type LiveEvent, type LiveState, type LiveView,
+} from "./live";
+import { GraphView } from "./view";
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
 const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string) => {
@@ -21,6 +27,20 @@ let view: GraphView | null = null;
 let vis: VisState | null = null;
 let lastInput: Record<string, any> = {};
 let focusLabel = "";
+type Mode = "overview" | "map" | "live";
+let mode: Mode = "map";
+let hasOverview = false;
+let ovHandle: OverviewHandle | null = null;
+let ovModel: Overview | null = null;
+let history: History | null = null;
+let marks: DiffMarks | null = null;
+let changesOpen = false;
+// live view (served by `graph_repo.py live`): the Live tab and the stream behind it
+let liveView: LiveView | null = null;
+let liveStream: { close(): void } | null = null;
+let reloading = false;
+let reloadAgain = false;
+let flashNext: LiveEvent | null = null;
 
 // ── host integration ──────────────────────────────────────────────────────
 function applyHostContext(ctx: HostContext): void {
@@ -121,9 +141,45 @@ function load(payload: Payload): void {
     expanded: new Set(),
     collapsed: new Set(),
     focus: null,
+    opened: new Set(),
   };
+  for (const k of NESTED_KINDS) vis.kinds.delete(k); // an agent's steps and the env vars open on double-click
   fitToBudget(model, vis);
   focusLabel = "";
+  // the overview is the calm way in; explore results and focused pages open straight on the map
+  ovHandle?.destroy();
+  ovHandle = null;
+  const ov = buildOverview(model);
+  ovModel = ov;
+  hasOverview = payload.mode !== "explore" && ov.itemCount >= 2;
+  if (hasOverview) {
+    ovHandle = renderOverview($("#overview"), ov, String(payload.repo?.name ?? model.repoLabel), {
+      glyph: (k, n) => glyph(k, n),
+      open: (it) => openItem(it),
+    });
+  }
+  // version control: open on the uncommitted work when there is some
+  history = ((payload as any).history as History | undefined) ?? null;
+  const working = history?.entries.find((e) => e.kind === "working" && e.diff);
+  marks = working ? marksFor(model, working) : null;
+  mode = hasOverview && !payload.focus ? "overview" : "map";
+  const live = (payload as any).live as { root: string; name: string; started: string; seq: number; interval: number } | undefined;
+  if (live && !liveStream) {
+    // served live: open on the Live tab, then follow the stream
+    liveView = {
+      state: {
+        root: live.root, name: live.name, started: live.started, seq: live.seq, interval: live.interval, events: [],
+        since: { id: "live-since", kind: "live", title: "Since you started watching", label: "this live session", files: [],
+          diff: null, summary: "no graph changes yet", changes: 0, by_claude: 0, at: live.started },
+        hook_seen: null, building: false, error: null,
+      },
+      conn: "connecting", follow: true, selected: null, fresh: new Set(),
+    };
+    mode = "live";
+    marks = null;
+    startLive();
+  }
+  applyMode();
   renderHeader();
   renderLegend();
   if (!view) {
@@ -132,12 +188,17 @@ function load(payload: Payload): void {
       onToggle: (n) => toggleNode(n),
       onHover: (n, x, y) => hoverTip(n, x, y),
     });
+    view.emphasis = (n) => (vis?.opened.has(n.id) ? breakdown(n) : []);
   }
   view.select(null);
   view.inset = { right: 0, bottom: 0 };
   closePanel();
+  closeChanges();
+  applyMode(); // again, now that the view exists: the Live tab keeps room for its panel
   refresh(true);
+  applyMarks();
   const focus = payload.focus ? model.byId.get(payload.focus) : null;
+  if (focus && OPENABLE.has(focus.kind) && breakdown(focus).length) vis.opened.add(focus.id); // explore an agent → its breakdown
   if (focus && payload.focusDepth) {
     // whole graph shipped with a focus: show the neighbourhood, keep "Show whole repo" local
     setTimeout(() => {
@@ -213,7 +274,368 @@ function refresh(reseed = false): void {
   view.collapsed = vis.collapsed;
   view.setData(nodes, links, { reseed });
   renderStatus(nodes.length);
-  updateLegendCounts();
+  renderLegend();
+}
+
+// ── version control ─────────────────────────────────────────────────────────
+function pickEntry(e: HistoryEntry | null): void {
+  if (!model) return;
+  if (mode === "live" || (!e && marks?.entry.kind === "live")) { pickLive(e); return; }
+  marks = e ? marksFor(model, e) : null;
+  applyMarks();
+}
+
+/** Change counts per overview row ([added, changed, removed]) for one entry. */
+function rowCounts(e: HistoryEntry): Map<OvItem, [number, number, number]> {
+  const counts = new Map<OvItem, [number, number, number]>();
+  const ov = ovModel;
+  const d = e.diff;
+  if (!ov || !model || !d) return counts;
+  const symbolPaths = new Set([...d.added, ...d.changed, ...d.removed]
+    .filter((r) => !/File$/.test(r.l)).map((r) => r.p));
+  ([[d.added, 0], [d.changed, 1], [d.removed, 2]] as const).forEach(([list, i]) => {
+    for (const r of list) {
+      if (/File$/.test(r.l) && i === 1 && symbolPaths.has(r.p)) continue; // its functions say it better
+      const n = model!.byId.get(r.id);
+      const it = (n && ov.itemOf(n)) || ov.itemOfPath(r.p);
+      if (!it) continue;
+      const c = counts.get(it) ?? [0, 0, 0];
+      c[i]++;
+      counts.set(it, c);
+    }
+  });
+  return counts;
+}
+
+function bannerLabel(e: HistoryEntry): string {
+  if (e.kind === "working") return "uncommitted work";
+  if (e.kind === "live") return e.label ?? liveLabel(e as LiveEvent);
+  return `${e.short} ${e.title}`;
+}
+
+/** Put the picked entry's marks on the overview rows and the map, and refresh the chip and panels. */
+function applyMarks(): void {
+  if (!model) return;
+  view?.setDiff(marks ? { added: marks.added, changed: marks.changed } : null);
+  if (ovHandle && ovModel) {
+    if (!marks || !marks.entry.diff) ovHandle.mark(null);
+    else {
+      const e = marks.entry;
+      ovHandle.mark(rowCounts(e), { label: bannerLabel(e), detail: e.summary, onClear: () => pickEntry(null) });
+    }
+  }
+  renderVcChip();
+  if (changesOpen) drawChanges();
+  drawLive();
+}
+
+// ── live ──────────────────────────────────────────────────────────────────
+function startLive(): void {
+  liveStream = connectLive({
+    hello: (s: LiveState) => {
+      if (!liveView) return;
+      const behind = s.seq !== liveView.state.seq; // changes happened while we were away (or the server restarted)
+      const selId = liveView.selected?.entry.id ?? "live-since";
+      liveView.state = s;
+      liveView.conn = "open";
+      if (behind) void reloadGraph();
+      else repickLive(selId);
+    },
+    change: (ev, since, seq) => {
+      if (!liveView) return;
+      const st = liveView.state;
+      if (ev) {
+        st.events = [ev, ...st.events.filter((e) => e.id !== ev.id)].slice(0, 200);
+        liveView.fresh.add(ev.id);
+        if (liveView.follow) flashNext = ev;
+      }
+      st.since = since;
+      st.seq = seq;
+      st.building = false;
+      st.error = null;
+      void reloadGraph();
+    },
+    update: (ev, since) => {
+      if (!liveView) return;
+      const st = liveView.state;
+      st.events = st.events.map((e) => (e.id === ev.id ? ev : e));
+      st.since = since;
+      repickLive(liveView.selected?.entry.id ?? null);
+    },
+    status: (building, error) => {
+      if (!liveView) return;
+      liveView.state.building = building;
+      liveView.state.error = error;
+      drawLive();
+    },
+    hook: (seen) => {
+      if (!liveView) return;
+      liveView.state.hook_seen = seen;
+      drawLive();
+    },
+    connection: (c) => {
+      if (!liveView) return;
+      liveView.conn = c;
+      drawLive();
+    },
+  });
+  setInterval(() => { if (mode === "live") tickTimes($("#live")); }, 5000);
+}
+
+/** Fetch the newest graph; changes that arrive meanwhile are folded into one more fetch. */
+async function reloadGraph(): Promise<void> {
+  if (reloading) { reloadAgain = true; return; }
+  reloading = true;
+  try {
+    do {
+      reloadAgain = false;
+      reloadInPlace(await fetchGraph());
+    } while (reloadAgain);
+  } catch (e) {
+    if (liveView) { liveView.state.error = (e as Error).message; drawLive(); }
+  } finally {
+    reloading = false;
+  }
+}
+
+/** Swap in a new graph and keep everything the user set up: tab, filters, folds, focus, selection, positions. */
+function reloadInPlace(payload: Payload): void {
+  if (!model || !vis || !view) { load(payload); return; }
+  const old = new Map(model.nodes.map((n) => [n.id, n]));
+  const selId = view.selected?.id ?? null;
+  model = new Model(payload);
+  for (const n of model.nodes) {
+    const o = old.get(n.id);
+    if (o && o.x !== undefined) { n.x = o.x; n.y = o.y; n.vx = 0; n.vy = 0; }
+  }
+  const has = (id: string) => model!.byId.has(id);
+  const keep = (s: Set<string>) => new Set([...s].filter(has));
+  vis.expanded = keep(vis.expanded);
+  vis.collapsed = keep(vis.collapsed);
+  vis.opened = keep(vis.opened);
+  if (vis.focus) vis.focus = keep(vis.focus);
+  ovHandle?.destroy();
+  ovHandle = null;
+  ovModel = buildOverview(model);
+  hasOverview = payload.mode !== "explore" && ovModel.itemCount >= 2;
+  if (hasOverview) {
+    ovHandle = renderOverview($("#overview"), ovModel, String(payload.repo?.name ?? model.repoLabel), {
+      glyph: (k, n) => glyph(k, n),
+      open: (it) => openItem(it),
+    });
+  }
+  history = ((payload as any).history as History | undefined) ?? null;
+  if (liveView && (payload as any).live) liveView.state.seq = (payload as any).live.seq;
+  refresh(false);
+  const sel = selId ? model.byId.get(selId) : null;
+  if (sel) { view.select(sel); if (!$("#panel").hidden) openPanel(sel); } else if (selId) select(null, false);
+  applyMode();
+  // what's marked: the newest change when following, otherwise whatever was picked before
+  const ev = flashNext;
+  flashNext = null;
+  if (ev && liveView?.follow) repickLive(ev.id);
+  else if (marks?.entry.kind === "live") repickLive(marks.entry.id);
+  else if (marks) {
+    const again = history?.entries.find((e) => e.id === marks!.entry.id);
+    marks = again ? marksFor(model, again) : null;
+    applyMarks();
+  } else applyMarks();
+  if (ev && ovHandle) ovHandle.flash(rowCounts(ev).keys());
+  renderHeader();
+}
+
+function liveEntry(id: string | null): HistoryEntry | null {
+  if (!liveView || !id) return null;
+  const st = liveView.state;
+  return id === st.since.id ? st.since : st.events.find((e) => e.id === id) ?? null;
+}
+
+function repickLive(id: string | null): void {
+  if (!model || !liveView) return;
+  const e = liveEntry(id);
+  liveView.selected = e ? marksFor(model, e) : null;
+  if (mode === "live" || marks?.entry.kind === "live") marks = liveView.selected;
+  applyMarks();
+}
+
+function pickLive(e: HistoryEntry | null): void {
+  if (!liveView) return;
+  // picking anything but the newest change stops following
+  const newest = liveView.state.events[0]?.id;
+  if (e && e.id !== newest) liveView.follow = false;
+  if (!e) liveView.follow = false;
+  marks = null;
+  liveView.selected = null;
+  repickLive(e?.id ?? null);
+}
+
+function setFollow(on: boolean): void {
+  if (!liveView) return;
+  liveView.follow = on;
+  if (on) repickLive(liveView.state.events[0]?.id ?? "live-since");
+  else drawLive();
+}
+
+function drawLive(): void {
+  if (mode !== "live" || !liveView || !model) return;
+  renderLive($("#live"), liveView, model, {
+    glyph: (k, n) => glyph(k, n),
+    pick: (e) => pickLive(e),
+    openNode: (n) => { setMode("map"); select(n, true); },
+    openLink: (url) => void openLink(url),
+    showInMap: () => showChangesInMap(),
+    setFollow: (on) => setFollow(on),
+  });
+  liveView.fresh.clear();
+}
+
+function renderVcChip(): void {
+  const chip = $("#vc");
+  chip.hidden = !history;
+  $("#ref").hidden = !!history;
+  if (!history) return;
+  const h = history;
+  chip.replaceChildren();
+  chip.append(el("span", "vc-branch", `${h.branch} @ ${h.short}`));
+  const working = h.entries.find((e) => e.kind === "working");
+  if (working) chip.append(el("span", "vc-badge is-dirty", `● ${working.files.length} uncommitted`));
+  if (h.upstream && h.ahead) chip.append(el("span", "vc-badge is-ahead", `↑${h.ahead} not pushed`));
+  if (!working && !(h.upstream && h.ahead)) chip.append(el("span", "vc-badge", `${h.entries.length} commits`));
+  chip.setAttribute("aria-expanded", String(changesOpen));
+  chip.title = "Uncommitted changes and recent commits";
+}
+
+function drawChanges(): void {
+  if (!model || !history) return;
+  const host = $("#changes");
+  renderChanges(host, history, model, marks, {
+    glyph: (k, n) => glyph(k, n),
+    pick: (e) => pickEntry(e),
+    openNode: (n) => { setMode("map"); select(n, true); },
+    openLink: (url) => void openLink(url),
+    close: () => closeChanges(),
+    showInMap: () => showChangesInMap(),
+  });
+}
+
+function openChanges(): void {
+  if (!history) return;
+  if (mode === "live") setMode(hasOverview ? "overview" : "map"); // both panels sit on the left
+  changesOpen = true;
+  const narrow = window.matchMedia("(max-width: 640px)").matches;
+  if (narrow) closePanel();
+  $("#changes").hidden = false;
+  $("#app").classList.toggle("changes-open", !narrow);
+  if (view && !narrow) view.inset = { ...view.inset, left: 360 };
+  drawChanges();
+  renderVcChip();
+}
+
+function closeChanges(): void {
+  changesOpen = false;
+  $("#changes").hidden = true;
+  $("#app").classList.remove("changes-open");
+  if (view) view.inset = { ...view.inset, left: 0 };
+  if (history) renderVcChip();
+}
+
+/** The map, narrowed to what the picked entry touched and what touches it. */
+function showChangesInMap(): void {
+  if (!model || !vis || !marks) return;
+  const touched = [...marks.added, ...marks.changed];
+  if (!touched.length) return;
+  const keep = new Set<string>();
+  for (const n of touched) {
+    keep.add(n.id);
+    for (const e of [...n.outE, ...n.inE]) if (e.group !== "contains") { keep.add(e.s.id); keep.add(e.t.id); }
+    if (n.fileOf) vis.expanded.add(n.fileOf.id);
+  }
+  for (const n of marks.affected) keep.add(n.id);
+  for (const id of [...keep]) for (let a = model.byId.get(id)?.parent; a; a = a.parent) { keep.add(a.id); vis.collapsed.delete(a.id); }
+  vis.focus = keep;
+  const e = marks.entry;
+  focusLabel = e.kind === "working" ? "uncommitted changes" : e.kind === "live"
+    ? (e.id === "live-since" ? "changes in this live session" : `changes from ${e.title.replace(/^Edited /, "")}`)
+    : `changes in ${e.short}`;
+  setMode("map");
+  select(null, false);
+  renderHeader();
+  refresh(true);
+}
+
+// ── overview ⇄ map ────────────────────────────────────────────────────────
+function applyMode(): void {
+  const isLive = mode === "live";
+  // the Live tab shows the overview (or the map, for a repo too small for one) with the changes beside it
+  const showsOverview = mode === "overview" || (isLive && hasOverview);
+  $("#overview").hidden = !showsOverview;
+  $("#app").dataset.mode = showsOverview ? "overview" : "map";
+  $("#app").dataset.tab = mode;
+  $("#modes").hidden = !hasOverview && !liveView;
+  document.querySelectorAll<HTMLButtonElement>("#modes button").forEach((b) => {
+    const m = b.dataset.mode as Mode;
+    b.hidden = (m === "overview" && !hasOverview) || (m === "live" && !liveView);
+    b.setAttribute("aria-selected", String(m === mode));
+  });
+  const narrow = window.matchMedia("(max-width: 640px)").matches;
+  $("#live").hidden = !isLive;
+  $("#app").classList.toggle("live-open", isLive && !narrow);
+  if (view) view.inset = { ...view.inset, left: (isLive || changesOpen) && !narrow ? 360 : 0 };
+  $("#scope-overview").hidden = !hasOverview;
+  renderHeader();
+  drawLive();
+}
+
+function setMode(m: Mode): void {
+  if (m === mode) return;
+  if (m !== "map") select(null, false);
+  if (m === "live" && changesOpen) closeChanges();
+  mode = m;
+  if (m === "live" && liveView && !marks) repickLive(liveView.selected?.entry.id ?? "live-since");
+  applyMode();
+}
+
+/** A row of the overview opens just that part of the graph. */
+function openItem(it: OvItem): void {
+  if (!model || !vis || !view) return;
+  setMode("map");
+  vis.opened.clear(); // each row opens on its own, not on top of the last one
+  if (it.node) {
+    const n = it.node;
+    if (OPENABLE.has(n.kind) && breakdown(n).length) vis.opened.add(n.id);
+    focusOn(n, 1);
+    select(n, false);
+    return;
+  }
+  if (it.overflow || !it.members.length) { void showAll(); return; }
+  // a folder group: its files (and their code when that stays small), plus what they link to
+  const inside: GNode[] = [];
+  const stack = [...it.members];
+  while (stack.length) {
+    const n = stack.pop()!;
+    inside.push(n);
+    stack.push(...n.children);
+  }
+  const code = inside.filter((n) => n.kind === "Function" || n.kind === "Class").length;
+  const detail = code <= 40;
+  const shown = (n: GNode): GNode => (!detail && (n.kind === "Function" || n.kind === "Class") && n.fileOf ? n.fileOf : n);
+  const keep = new Set<string>();
+  for (const n of inside) keep.add(shown(n).id);
+  for (const n of inside) {
+    for (const e of [...n.outE, ...n.inE]) {
+      if (e.group === "contains") continue;
+      keep.add(shown(e.s).id);
+      keep.add(shown(e.t).id);
+    }
+  }
+  for (const id of [...keep]) for (let a = model.byId.get(id)?.parent; a; a = a.parent) keep.add(a.id);
+  for (const n of inside) for (let a = n.parent; a; a = a.parent) vis.collapsed.delete(a.id);
+  for (const f of it.members) if (detail) vis.expanded.add(f.id); else vis.expanded.delete(f.id);
+  vis.focus = keep;
+  focusLabel = (it.prefix ?? "") + it.label;
+  select(null, false);
+  renderHeader();
+  refresh(true);
 }
 
 function renderHeader(): void {
@@ -236,7 +658,7 @@ function renderHeader(): void {
   if (st.build_ms !== undefined) parts.push(`parsed in ${(st.build_ms / 1000).toFixed(st.build_ms < 1000 ? 2 : 1)} s`);
   meta.textContent = parts.join(", ");
   const scope = $("#scope");
-  const exploring = model.payload.mode === "explore" || !!vis?.focus;
+  const exploring = mode === "map" && (model.payload.mode === "explore" || !!vis?.focus);
   scope.hidden = !exploring;
   if (exploring) {
     $("#scope-label").textContent = focusLabel ? `Around ${focusLabel}` : "Partial view";
@@ -255,8 +677,13 @@ function renderStatus(visibleCount: number): void {
       folded ? `${fmt.format(folded)} folder${folded > 1 ? "s" : ""} folded` : "",
     ].filter(Boolean).join(" and ");
     notes.push(`Overview of a large repo: ${what}. Double-click a folder or file to open it, or turn kinds on below.`);
+  } else if (vis.focus && mode === "map" && [...vis.focus].every((id) => model!.byId.get(id)?.kind !== "Function")) {
+    notes.push("Showing files only. Double-click a file to open its functions.");
   } else if (!vis.kinds.has("Function") && model.kindCounts.get("Function")) {
     notes.push("Functions are hidden. Double-click a file to show its functions.");
+  }
+  if (model.kindCounts.get("GenAI") && !vis.opened.size) {
+    notes.push("Double-click an agent, MCP server, service or env var to break it down into the code behind it.");
   }
   if (model.payload.truncated) notes.push(`Showing the ${fmt.format(model.nodes.length)} most connected of ${fmt.format(model.payload.totalNodes ?? 0)} nodes.`);
   if (!visibleCount) notes.push("Everything is filtered out. Turn some kinds back on below.");
@@ -264,27 +691,35 @@ function renderStatus(visibleCount: number): void {
 }
 
 // ── legend / filters ──────────────────────────────────────────────────────
-function glyph(kind: Kind): HTMLCanvasElement {
+function glyph(kind: Kind, n?: GNode): HTMLCanvasElement {
+  const size = 16;
   const c = el("canvas", "glyph");
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  c.width = c.height = 14 * dpr;
+  c.width = c.height = size * dpr;
   const ctx = c.getContext("2d")!;
   ctx.scale(dpr, dpr);
-  const color = getComputedStyle(document.documentElement).getPropertyValue(KIND[kind].color).trim();
-  ctx.beginPath();
-  shapePath(ctx, KIND[kind].shape === "ring" ? "dot" : KIND[kind].shape, 7, 7, KIND[kind].shape === "dot" ? 3.6 : 4.6);
-  if (KIND[kind].shape === "ring") { ctx.lineWidth = 1.8; ctx.strokeStyle = color; ctx.stroke(); }
-  else { ctx.fillStyle = color; ctx.fill(); }
+  const cs = getComputedStyle(document.documentElement);
+  const shape = n ? shapeOf(n) : KIND[kind].shape;
+  drawGlyph(ctx, shape, size, cs.getPropertyValue(KIND[kind].color).trim(), cs.getPropertyValue("--on-kind").trim());
   return c;
 }
 
 function renderLegend(): void {
   if (!model || !vis) return;
+  // only what's in scope: a focused view lists the few kinds it actually shows
+  const scope = vis.focus;
+  const kindCounts = new Map<Kind, number>();
+  for (const n of model.nodes) if (!scope || scope.has(n.id)) kindCounts.set(n.kind, (kindCounts.get(n.kind) ?? 0) + 1);
+  const groupCounts = new Map<Group, number>();
+  for (const e of model.edges) {
+    if (scope && !(scope.has(e.s.id) && scope.has(e.t.id))) continue;
+    groupCounts.set(e.group, (groupCounts.get(e.group) ?? 0) + 1);
+  }
   const kinds = $("#kinds");
   kinds.replaceChildren();
   for (const k of KINDS) {
-    const count = model.kindCounts.get(k.key) ?? 0;
-    if (!count) continue;
+    const count = kindCounts.get(k.key) ?? 0;
+    if (!count || k.chip === false) continue;
     const b = el("button", "chip");
     b.dataset.kind = k.key;
     b.setAttribute("aria-pressed", String(vis.kinds.has(k.key)));
@@ -301,7 +736,7 @@ function renderLegend(): void {
   const groups = $("#groups");
   groups.replaceChildren();
   for (const g of LINK_GROUPS) {
-    const count = model.groupCounts.get(g.key) ?? 0;
+    const count = groupCounts.get(g.key) ?? 0;
     if (!count) continue;
     const b = el("button", "chip chip-link");
     b.dataset.group = g.key;
@@ -319,15 +754,10 @@ function renderLegend(): void {
   }
 }
 
-function updateLegendCounts(): void {
-  document.querySelectorAll<HTMLButtonElement>("#kinds .chip").forEach((b) => {
-    b.setAttribute("aria-pressed", String(vis?.kinds.has(b.dataset.kind as Kind)));
-  });
-}
-
 // ── selection, panel ──────────────────────────────────────────────────────
 function labelOf(n: GNode): string {
   if (n.kind === "Function" || n.kind === "Class") return n.props.qualname ?? n.name;
+  if (isGenAI(n.kind)) return n.name;
   if (n.kind === "Folder") return n.props.is_root ? n.name : `${n.path || n.name}/`;
   return n.kind === "ApiEndpoint" ? n.name : n.path || n.name;
 }
@@ -339,7 +769,13 @@ function ensureVisible(n: GNode): void {
     vis.expanded.add(n.fileOf.id);
     changed = true;
   }
-  if (!vis.kinds.has(n.kind) && !(n.kind === "Function" || n.kind === "Class")) { vis.kinds.add(n.kind); changed = true; }
+  if (NESTED_KINDS.has(n.kind) && !vis.kinds.has(n.kind) && n.parent && !vis.opened.has(n.parent.id)) {
+    vis.opened.add(n.parent.id);
+    changed = true;
+  } else if (!vis.kinds.has(n.kind) && !(n.kind === "Function" || n.kind === "Class") && !NESTED_KINDS.has(n.kind)) {
+    vis.kinds.add(n.kind);
+    changed = true;
+  }
   for (let a = n.parent; a; a = a.parent) if (vis.collapsed.delete(a.id)) changed = true;
   if (vis.focus && !vis.focus.has(n.id)) { vis.focus = null; changed = true; renderHeader(); }
   if (changed) refresh();
@@ -354,7 +790,7 @@ function select(n: GNode | null, center: boolean): void {
   const panel = $("#panel").getBoundingClientRect();
   const stage = $("#canvas").getBoundingClientRect();
   const sheet = panel.width > stage.width * 0.8; // narrow layout: panel is a bottom sheet
-  view.inset = sheet ? { right: 0, bottom: panel.height + 8 } : { right: panel.width + 10, bottom: 0 };
+  view.inset = sheet ? { right: 0, bottom: panel.height + 8 } : { right: panel.width + 10, bottom: 0, left: view.inset.left };
   if (center) view.centerOn(n);
   if (bridge.connected && bridge.hostCapabilities.updateModelContext) {
     const where = n.path ? ` in ${n.path}${n.props.line ? `:${n.props.line}` : ""}` : "";
@@ -369,15 +805,70 @@ function toggleNode(n: GNode): void {
   if (!vis) return;
   if (isFile(n.kind)) {
     if (vis.expanded.has(n.id)) vis.expanded.delete(n.id);
-    else vis.expanded.add(n.id);
+    else {
+      vis.expanded.add(n.id);
+      if (vis.focus) { // a focused view grows to include the file's code and what it links to
+        const todo = [...n.children];
+        while (todo.length) {
+          const c = todo.pop()!;
+          vis.focus.add(c.id);
+          for (const e of [...c.outE, ...c.inE]) if (e.group !== "contains") { vis.focus.add(e.s.id); vis.focus.add(e.t.id); }
+          todo.push(...c.children);
+        }
+        for (const id of [...vis.focus]) for (let a = model?.byId.get(id)?.parent; a; a = a.parent) vis.focus.add(a.id);
+      }
+    }
     refresh();
-  } else if (n.kind === "Folder" && !n.props.is_root) {
+  } else if ((n.kind === "Folder" && !n.props.is_root) || n.kind === "GenAI") {
     if (vis.collapsed.has(n.id)) vis.collapsed.delete(n.id);
     else vis.collapsed.add(n.id);
     refresh();
+  } else if (OPENABLE.has(n.kind)) {
+    if (vis.opened.has(n.id)) vis.opened.delete(n.id);
+    else vis.opened.add(n.id);
+    refresh();
+    select(n, false);
+    // frame the node together with what it broke down into, once they've moved into place
+    if (vis.opened.has(n.id) && view) {
+      const parts = [n, ...breakdown(n)];
+      setTimeout(() => view?.fit(true, parts.filter((p) => p.x !== undefined)), 420);
+    }
   } else {
     select(n, true);
   }
+}
+
+const isOpenable = (n: GNode) => OPENABLE.has(n.kind) && breakdown(n).length > 0;
+
+/** Agent: its steps in order, where each goes next and what it runs. */
+function flowSection(n: GNode): HTMLElement | null {
+  const steps = n.children.filter((c) => c.kind === "AgentStep").sort((a, b) => (a.props.order ?? 0) - (b.props.order ?? 0));
+  if (!steps.length) return null;
+  const sec = el("section", "rel");
+  sec.append(el("h3", "rel-title", `Flow (${steps.length} step${steps.length > 1 ? "s" : ""})`));
+  const ol = el("ol", "flow-list");
+  for (const st of steps) {
+    const li = el("li", "flow-step");
+    const b = el("button", "rel-item");
+    b.append(glyph(st.kind, st), el("span", "rel-name", st.name));
+    if (st.props.entry) b.append(el("span", "flow-badge", "start"));
+    b.onclick = () => select(st, true);
+    li.append(b);
+    const nexts = st.outE.filter((e) => e.rel === "NEXT");
+    const runs = st.outE.filter((e) => e.rel === "RUNS").map((e) => e.t);
+    const tools = st.outE.filter((e) => e.rel === "USES_TOOL").map((e) => e.t);
+    const lines: string[] = [];
+    if (runs.length) lines.push(`runs ${runs.map((r) => r.kind === "Agent" ? `${r.name} (sub-agent)` : `${r.name}()`).join(", ")}`);
+    else if (st.props.kind === "tools") lines.push(`runs the agent's tools${tools.length ? `: ${tools.map((t) => t.name).join(", ")}` : ""}`);
+    else if (st.props.runs) lines.push(`runs ${st.props.runs} (not found in the code graph)`);
+    const to = nexts.map((e) => e.t.name + (e.props?.kind === "conditional" ? " (if)" : e.props?.kind === "goto" ? " (goto)" : ""));
+    if (st.props.can_end) to.push("END");
+    if (to.length) lines.push(`then → ${to.join(", ")}`);
+    if (lines.length) li.append(el("p", "flow-note", lines.join(" · ")));
+    ol.append(li);
+  }
+  sec.append(ol);
+  return sec;
 }
 
 function openPanel(n: GNode): void {
@@ -386,9 +877,13 @@ function openPanel(n: GNode): void {
   p.hidden = false;
   const body = el("div", "panel-body");
   const kind = el("p", "panel-kind");
-  kind.append(glyph(n.kind), document.createTextNode(SINGULAR[n.kind] + (n.props.defined_in_repo === false ? ", not defined in this repo" : "")));
-  const title = el("h2", `panel-title ${["Function", "Class", "ApiEndpoint"].includes(n.kind) ? "is-code" : ""}`, labelOf(n));
+  const kindText = n.kind === "ExternalService" && n.props.category ? `${n.props.category} service`
+    : n.kind === "Function" && n.props.ai_tool ? `Function, used as ${String(n.props.ai_tool).replace(/^(MCP|agent|LangChain)/, (m) => m === "agent" ? "an agent" : m === "MCP" ? "an MCP" : "a LangChain")}`
+    : SINGULAR[n.kind] + (n.props.defined_in_repo === false ? ", not defined in this repo" : "");
+  kind.append(glyph(n.kind, n), document.createTextNode(kindText));
+  const title = el("h2", `panel-title ${["Function", "Class", "ApiEndpoint", "AgentStep", "EnvVar"].includes(n.kind) ? "is-code" : ""}`, labelOf(n));
   body.append(kind, title);
+  if (n.props.warning) body.append(el("p", "panel-warn", String(n.props.warning)));
 
   if (n.path && n.kind !== "Folder") {
     const loc = el("p", "panel-loc");
@@ -406,6 +901,20 @@ function openPanel(n: GNode): void {
   if (n.props.summary) body.append(el("p", "panel-summary", String(n.props.summary)));
   const facts: string[] = [];
   if (n.props.framework) facts.push(String(n.props.framework));
+  if (n.kind === "Agent" && n.props.steps) facts.push(`${n.props.steps} steps`);
+  if (n.kind === "McpServer") {
+    const parts = [["tools", n.props.tools], ["resources", n.props.resources], ["prompts", n.props.prompts]]
+      .filter(([, c]) => c).map(([w, c]) => `${c} ${c === 1 ? String(w).slice(0, -1) : w}`);
+    if (parts.length) facts.push(parts.join(", "));
+    if (n.props.transport) facts.push(`${n.props.transport} transport`);
+  }
+  if (n.kind === "EnvVar") {
+    facts.push(n.props.mode === "required" ? "Required: the app fails without it" : n.props.mode === "default" ? "Has a default" : "Optional: empty when unset");
+    if (n.props.reads) facts.push(`read in ${n.props.reads} place${n.props.reads > 1 ? "s" : ""}`);
+  }
+  if (n.kind === "EnvGroup") facts.push(`${n.props.count} variables, ${n.props.required ?? 0} required`);
+  if (n.kind === "ExternalService" && n.props.sdks?.length) facts.push(`via ${n.props.sdks.slice(0, 3).join(", ")}`);
+  if (n.kind === "AgentStep" && n.props.kind === "tools") facts.push("tool-calling step");
   if (n.props.test_framework && n.props.test_framework !== "None") facts.push(String(n.props.test_framework));
   if (n.props.language) facts.push(String(n.props.language));
   if (n.props.loc) facts.push(`${fmt.format(n.props.loc)} lines`);
@@ -413,29 +922,51 @@ function openPanel(n: GNode): void {
   if (n.props.async) facts.push("async");
   if (facts.length) body.append(el("p", "panel-facts", facts.join(", ")));
 
+  if (n.kind === "Agent") {
+    const flow = flowSection(n);
+    if (flow) body.append(flow);
+  }
+  const unresolved = [...(n.props.unresolved ?? []), ...(n.props.tools_unresolved ?? []).map((t: string) => `tool ${t}`)];
+  if (unresolved.length) {
+    const sec = el("section", "rel");
+    sec.append(el("h3", "rel-title", "Not linked to code"), el("p", "panel-note", unresolved.slice(0, 8).join("; ") + "."));
+    body.append(sec);
+  }
+
   // relationships grouped by how they read from this node
-  const groups = new Map<string, GNode[]>();
+  const groups = new Map<string, { o: GNode; e: GEdge }[]>();
   for (const e of n.outE) {
+    if (n.kind === "Agent" && e.rel === "BELONGS_TO" && e.t.kind === "GenAI") continue;
     const k = relPhrase(e.rel, "out");
-    (groups.get(k) ?? groups.set(k, []).get(k)!).push(e.t);
+    (groups.get(k) ?? groups.set(k, []).get(k)!).push({ o: e.t, e });
   }
   for (const e of n.inE) {
+    if (n.kind === "Agent" && e.s.kind === "AgentStep" && e.rel === "BELONGS_TO") continue; // shown as the flow
     const k = relPhrase(e.rel, "in");
-    (groups.get(k) ?? groups.set(k, []).get(k)!).push(e.s);
+    (groups.get(k) ?? groups.set(k, []).get(k)!).push({ o: e.s, e });
   }
-  const order = ["Called by", "Calls", "Requested by", "Requests", "Tested by", "Tests", "Imported by", "Imports", "Extends", "Extended by", "Contains", "Inside"];
+  const order = ["Runs", "Decided by", "Uses tools", "Exposes", "Goes to", "Comes after", "Run by", "Decides for", "Tool of", "Exposed by",
+    "Uses", "Used by", "Reads", "Read by", "Called by", "Calls", "Requested by", "Requests", "Tested by", "Tests", "Imported by", "Imports",
+    "Extends", "Extended by", "Contains", "Inside"];
   for (const key of order) {
     const list = groups.get(key);
     if (!list?.length) continue;
-    const uniq = [...new Set(list)];
+    const seen = new Set<GNode>();
+    const uniq = list.filter(({ o }) => !seen.has(o) && !!seen.add(o));
     const sec = el("section", "rel");
     sec.append(el("h3", "rel-title", `${key} (${fmt.format(uniq.length)})`));
     const ul = el("ul", "rel-list");
-    for (const o of uniq.slice(0, 40)) {
+    for (const { o, e } of uniq.slice(0, 40)) {
       const li = el("li");
       const b = el("button", "rel-item");
-      b.append(glyph(o.kind), el("span", "rel-name", labelOf(o)));
-      if ((o.kind === "Function" || o.kind === "Class") && o.path) b.append(el("span", "rel-path", o.path));
+      b.append(glyph(o.kind, o), el("span", "rel-name", labelOf(o)));
+      const where = !e.props?.line ? "" : e.props.file && e.props.file !== o.path ? `${e.props.file}:${e.props.line}` : `line ${e.props.line}`;
+      if (where) {
+        const tip = [e.props?.how, e.props?.basis === "inferred" ? "inferred" : ""].filter(Boolean).join(" · ");
+        const span = el("span", "rel-path", where);
+        if (tip) span.title = tip;
+        b.append(span);
+      } else if ((o.kind === "Function" || o.kind === "Class") && o.path) b.append(el("span", "rel-path", o.path));
       b.onclick = () => select(o, true);
       li.append(b);
       ul.append(li);
@@ -446,6 +977,13 @@ function openPanel(n: GNode): void {
   }
 
   const actions = el("div", "panel-actions");
+  if (isOpenable(n)) {
+    const open = el("button", "btn", vis?.opened.has(n.id) ? "Fold back" : n.kind === "Agent" ? "Break down into steps and code"
+      : n.kind === "ExternalService" ? "Show the code that uses it" : n.kind === "EnvVar" ? "Show where it's read"
+      : n.kind === "EnvGroup" ? "Show all variables" : "Show its parts");
+    open.onclick = () => { toggleNode(n); openPanel(n); };
+    actions.append(open);
+  }
   const near = el("button", "btn", "Show only its neighbours");
   near.onclick = () => focusOn(n);
   actions.append(near);
@@ -481,7 +1019,7 @@ function panelHeader(): HTMLElement {
 
 function closePanel(): void {
   $("#panel").hidden = true;
-  if (view) view.inset = { right: 0, bottom: 0 };
+  if (view) view.inset = { right: 0, bottom: 0, left: view.inset.left };
 }
 
 function focusOn(n: GNode, depth = 1): void {
@@ -562,6 +1100,7 @@ function setupSearch(): void {
     items = [];
     render();
     input.blur();
+    setMode("map");
     select(n, true);
   };
   input.addEventListener("input", () => {
@@ -600,6 +1139,11 @@ function wire(): void {
   $("#zoom-in").onclick = () => view?.zoomBy(1.3);
   $("#zoom-out").onclick = () => view?.zoomBy(1 / 1.3);
   $("#scope-reset").onclick = () => void showAll();
+  $("#scope-overview").onclick = () => setMode("overview");
+  $("#vc").onclick = () => (changesOpen ? closeChanges() : openChanges());
+  document.querySelectorAll<HTMLButtonElement>("#modes button").forEach((b) => {
+    b.onclick = () => setMode(b.dataset.mode as Mode);
+  });
   $("#fullscreen").onclick = async () => {
     const next = bridge.hostContext.displayMode === "fullscreen" ? "inline" : "fullscreen";
     try {
@@ -616,6 +1160,17 @@ function wire(): void {
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => view?.readPalette());
   window.addEventListener("resize", () => bridge.connected && sizeToHost());
 }
+
+// read-only handle for automated checks of the published page
+(window as any).__repoGraph = {
+  screenOf(id: string) {
+    const n = model?.byId.get(id);
+    if (!n || !view || n.x === undefined) return null;
+    const r = $("#canvas").getBoundingClientRect();
+    return { x: r.left + n.x * view.k + view.tx, y: r.top + n.y! * view.k + view.ty, visible: view.nodes.includes(n) };
+  },
+  visibleIds: () => view?.nodes.map((n) => n.id) ?? [],
+};
 
 async function boot(): Promise<void> {
   wire();

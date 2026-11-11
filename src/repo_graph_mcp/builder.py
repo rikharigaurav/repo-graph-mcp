@@ -19,8 +19,10 @@ from pathlib import Path
 from typing import Callable
 
 from . import graph as G
+from .genai import add_genai_layer
 from .classify import classify, detect_test_framework, ext_of, is_ignored_dir, language_of
 from .graph import CodeGraph, Node
+from .parsecache import ParseCache, body_hash, content_hash
 from .parsers.base import FileParse, normalize_route
 from .parsers.js_parser import parse_js
 from .parsers.python_parser import parse_python
@@ -45,6 +47,7 @@ class FileInfo:
     size: int
     node_id: str
     parse: FileParse | None = None
+    digest: str = ""  # sha1 of the file's bytes
     sym_ids: dict[str, list[str]] = field(default_factory=dict)  # qualname -> node ids
     module_aliases: dict[str, str] = field(default_factory=dict)  # receiver text -> file rel
     imported: dict[str, tuple[str, str]] = field(default_factory=dict)  # local -> (file rel, original name)
@@ -62,8 +65,10 @@ def folder_id(rel: str) -> str:
 
 
 class Builder:
-    def __init__(self, root: Path, repo: dict, progress: Callable[[float, str], None] | None = None):
+    def __init__(self, root: Path, repo: dict, progress: Callable[[float, str], None] | None = None,
+                 parse_cache: ParseCache | None = None):
         self.root = root
+        self.cache = parse_cache
         self.repo = repo
         self.g = CodeGraph(repo)
         self.files: dict[str, FileInfo] = {}
@@ -75,6 +80,7 @@ class Builder:
         self.endpoint_by_route: dict[str, list[str]] = defaultdict(list)
         self._routes_by_len: dict[int, list[tuple[list[str], str, list[str]]]] | None = None
         self.counters: Counter = Counter()
+        self.genai_stats: dict[str, int] = {}
 
     # ── 1. walk ────────────────────────────────────────────────────────────
     def walk(self) -> None:
@@ -159,16 +165,28 @@ class Builder:
                 data = (self.root / f.rel).read_bytes()
             except OSError:
                 continue
+            f.digest = content_hash(data)
+            self.g.nodes[f.node_id].props["hash"] = f.digest[:12]
             if _looks_minified(data):
                 self.counters["files_minified"] += 1
                 continue
-            try:
-                f.parse = parse_python(data) if f.language == "python" else parse_js(data, f.language)
-                self.counters["files_parsed"] += 1
-            except Exception as e:  # never let one weird file kill the graph
-                log.warning("parse failed for %s: %s", f.rel, e)
-                self.counters["files_failed"] += 1
-                continue
+            cached = self.cache.get(f.language, f.digest) if self.cache else None
+            if cached is not None:
+                f.parse = cached
+                self.counters["files_from_cache"] += 1
+            else:
+                try:
+                    f.parse = parse_python(data) if f.language == "python" else parse_js(data, f.language)
+                except Exception as e:  # never let one weird file kill the graph
+                    log.warning("parse failed for %s: %s", f.rel, e)
+                    self.counters["files_failed"] += 1
+                    continue
+                lines = data.split(b"\n")
+                for s in f.parse.symbols:
+                    s.body_hash = body_hash(lines, s.line, s.end_line)
+                if self.cache:
+                    self.cache.put(f.language, f.digest, f.parse)
+            self.counters["files_parsed"] += 1
             node = self.g.nodes[f.node_id]
             node.props["loc"] = f.parse.loc
             if f.parse.module_doc:
@@ -219,17 +237,22 @@ class Builder:
                 if next_route and s.kind == "function" and s.name.upper() in G.HTTP_METHODS and "." not in s.qualname:
                     eid = self._add_endpoint(s.name.upper(), next_route, f, s.line, "next.js", s.qualname,
                                              doc=s.docstring, sig=s.signature)
+                    if s.body_hash:
+                        self.g.nodes[eid].props["h"] = s.body_hash
                     f.sym_ids[s.qualname] = [eid]
                     continue
                 if pages_api and p.default_export == s.name:
                     eid = self._add_endpoint("ANY", pages_api, f, s.line, "next.js", s.qualname,
                                              doc=s.docstring, sig=s.signature)
+                    if s.body_hash:
+                        self.g.nodes[eid].props["h"] = s.body_hash
                     f.sym_ids[s.qualname] = [eid]
                     continue
                 if s.qualname in handler_eps:
                     for eid in handler_eps[s.qualname]:
                         n = self.g.nodes[eid]
                         n.props.update({"line": s.line, "end_line": s.end_line, "signature": s.signature,
+                                        **({"h": s.body_hash} if s.body_hash else {}),
                                         **({"summary": s.docstring} if s.docstring else {})})
                     f.sym_ids[s.qualname] = handler_eps[s.qualname]
                     continue
@@ -251,6 +274,8 @@ class Builder:
                     props["async"] = True
                 if s.bases:
                     props["bases"] = s.bases
+                if s.body_hash:
+                    props["h"] = s.body_hash
                 self.g.add_node(Node(nid, label, s.name, f.rel, props))
                 f.sym_ids.setdefault(s.qualname, []).append(nid)
             # containment: method -> class, nested -> outer, top-level -> file
@@ -648,15 +673,18 @@ class Builder:
             "files_parsed": self.counters["files_parsed"], "files_ignored": self.counters["files_ignored"],
             "files_too_large": self.counters["files_too_large"] + extra.get("skipped_large", 0),
             "files_minified": self.counters["files_minified"], "files_failed": self.counters["files_failed"],
+            **({"files_from_cache": self.counters["files_from_cache"]} if self.counters["files_from_cache"] else {}),
             "build_ms": int((time.perf_counter() - started) * 1000),
+            **({"genai": self.genai_stats} if self.genai_stats else {}),
         }
         return self.g
 
 
 def build_graph(root: Path, repo: dict, progress: Callable[[float, str], None] | None = None,
-                extra: dict | None = None) -> CodeGraph:
+                extra: dict | None = None, parse_cache: ParseCache | None = None) -> CodeGraph:
+    """`parse_cache` reuses the parse of any file whose bytes it has seen before (see parsecache.py)."""
     started = time.perf_counter()
-    b = Builder(root, repo, progress)
+    b = Builder(root, repo, progress, parse_cache)
     b.progress(0.3, "Scanning files")
     b.walk()
     b.parse_all()
@@ -665,6 +693,8 @@ def build_graph(root: Path, repo: dict, progress: Callable[[float, str], None] |
     b.resolve_imports()
     b.progress(0.9, "Linking calls")
     b.resolve_calls()
+    b.progress(0.95, "Finding agents, services and env vars")
+    add_genai_layer(b)
     return b.finalize(started, extra or {})
 
 

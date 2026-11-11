@@ -244,12 +244,28 @@ def _safe_extract(tar_path: Path, dest: Path, subpath: str = "") -> int:
     return skipped
 
 
-def clone_git(spec: RepoSpec, work_dir: Path) -> Checkout:
+def remote_head(spec: RepoSpec) -> str | None:
+    """The commit a remote branch (or the default branch) points at, without cloning."""
+    if not shutil.which("git"):
+        return None
+    resolve_tree_ref_git(spec)
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    p = subprocess.run(["git", "ls-remote", spec.url, spec.ref or "HEAD"], capture_output=True, text=True,
+                       timeout=60, env=env)
+    for line in p.stdout.splitlines():
+        sha, _, name = line.partition("\t")
+        if name in ("HEAD", spec.ref, f"refs/heads/{spec.ref}", f"refs/tags/{spec.ref}"):
+            return sha
+    return None
+
+
+def clone_git(spec: RepoSpec, work_dir: Path, depth: int = 1) -> Checkout:
+    """Shallow clone; `depth` > 1 keeps that many commits of history (for the changes view)."""
     if not shutil.which("git"):
         raise FetchError("git is not installed on the MCP server, so only GitHub repos and local paths work.")
     resolve_tree_ref_git(spec)
     dest = work_dir / "src"
-    cmd = ["git", "clone", "--depth", "1", "--single-branch", "--no-tags"]
+    cmd = ["git", "clone", "--depth", str(max(depth, 1)), "--single-branch", "--no-tags"]
     if spec.ref:
         cmd += ["--branch", spec.ref]
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}

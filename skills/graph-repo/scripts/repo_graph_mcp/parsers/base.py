@@ -20,6 +20,7 @@ class Symbol:
     bases: list[str] = field(default_factory=list)  # classes only
     is_async: bool = False
     exported: bool = False
+    body_hash: str = ""  # fingerprint of its source lines, for telling what changed between builds
 
 
 @dataclass

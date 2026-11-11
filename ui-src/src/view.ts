@@ -2,19 +2,26 @@ import {
   forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY,
   type Simulation,
 } from "d3-force";
-import { KIND, type GNode, type Group, type Kind, type VLink } from "./model";
+import { cornerPath, detailPath, flapPath, fontWithSize, halfWidth, iconPath, markFor } from "./icons";
+import { KIND, shapeOf, type GNode, type Group, type Kind, type Shape, type VLink } from "./model";
 
 interface Palette {
   kind: Record<Kind, string>;
   edge: Record<Group, string>;
   ink: string; ink2: string; ink3: string; map: string; halo: string;
-  regionFill: string; regionStroke: string; regionLabel: string; select: string;
+  regionFill: string; regionStroke: string; regionLabel: string; select: string; onKind: string; warn: string;
+  added: string; changed: string;
 }
 
-const SHAPE_ORDER: Kind[] = ["Folder", "DocumentationFile", "TemplateMarkupFile", "TestingFile", "DataFile", "Class", "ApiEndpoint", "Function"];
+const SHAPE_ORDER: Kind[] = [
+  "Folder", "GenAI", "EnvGroup", "DocumentationFile", "TemplateMarkupFile", "TestingFile", "DataFile", "Class", "ApiEndpoint",
+  "ExternalService", "McpServer", "Agent", "AgentStep", "Function", "EnvVar",
+];
 const LABEL_RANK: Record<Kind, number> = {
-  Folder: 1, ApiEndpoint: 2, DataFile: 3, TestingFile: 4, Class: 4, TemplateMarkupFile: 5, DocumentationFile: 6, Function: 6,
+  Folder: 1, GenAI: 1, Agent: 1, ApiEndpoint: 2, McpServer: 2, ExternalService: 2, DataFile: 3, AgentStep: 3, EnvGroup: 3,
+  TestingFile: 4, Class: 4, TemplateMarkupFile: 5, DocumentationFile: 6, Function: 6, EnvVar: 5,
 };
+const CODE_LABEL = new Set<Kind>(["Function", "Class", "ApiEndpoint", "AgentStep", "EnvVar"]);
 
 export interface ViewCallbacks {
   onSelect(n: GNode | null): void;
@@ -72,12 +79,14 @@ export class GraphView {
   // ── data ────────────────────────────────────────────────────────────────
   setData(nodes: GNode[], links: VLink[], opts: { reseed: boolean }): void {
     const prev = new Set(this.nodes);
+    // after a live reload the nodes are new objects carrying the old positions: keep those in place
+    const prevIds = new Set(this.nodes.map((n) => n.id));
     this.nodes = nodes;
     this.links = links;
     if (opts.reseed) seedRadial(nodes);
     else {
       for (const n of nodes) {
-        if (prev.has(n) && n.x !== undefined) continue;
+        if ((prev.has(n) || prevIds.has(n.id)) && n.x !== undefined) continue;
         const anchor = nearestPlaced(n, prev);
         const a = Math.random() * Math.PI * 2;
         n.x = (anchor?.x ?? 0) + Math.cos(a) * 14;
@@ -96,8 +105,9 @@ export class GraphView {
         .strength((d) => -(18 + d.r * (big ? 4 : 7)) * (d.kind === "Folder" ? 2.2 : 1))
         .distanceMax(big ? 260 : 420)
         .theta(big ? 1.1 : 0.9))
-      .force("collide", forceCollide<GNode>((d) => d.r + 2.5).iterations(1))
+      .force("collide", forceCollide<GNode>((d) => hw(d) + 2.5).iterations(1))
       .force("territory", territoryForce(0.06))
+      .force("aside", asideForce())
       .force("x", forceX<GNode>(0).strength(0.035))
       .force("y", forceY<GNode>(0).strength(0.045));
     this.hullCache.clear();
@@ -115,6 +125,7 @@ export class GraphView {
       this.sim.alpha(this.reducedMotion ? 0 : 0.35).restart();
       if (this.reducedMotion) for (let i = 0; i < 120; i++) this.sim.tick();
     }
+    this.remark();
     this.refreshHighlight();
     this.invalidate(true);
   }
@@ -132,10 +143,11 @@ export class GraphView {
       edge: {
         contains: v("--e-contains"), calls: v("--e-calls"), imports: v("--e-imports"),
         http: v("--e-http"), tests: v("--e-tests"), extends: v("--e-extends"),
+        flow: v("--e-flow"), runs: v("--e-runs"), uses: v("--e-uses"), env: v("--e-env"),
       },
       ink: v("--ink"), ink2: v("--ink-2"), ink3: v("--ink-3"), map: v("--map"), halo: v("--halo"),
       regionFill: v("--region-fill"), regionStroke: v("--region-stroke"), regionLabel: v("--region-label"),
-      select: v("--select"),
+      select: v("--select"), onKind: v("--on-kind"), warn: v("--warn"), added: v("--vc-add"), changed: v("--vc-chg"),
     };
     this.invalidate();
   }
@@ -165,19 +177,20 @@ export class GraphView {
     }
     const pad = 36;
     const labelRoom = pts.length < 80 ? 150 : 0; // small graphs show labels to the right of each node
-    const w = this.w - this.inset.right - labelRoom, h = this.h - this.inset.bottom;
+    const left = this.inset.left ?? 0;
+    const w = this.w - this.inset.right - left - labelRoom, h = this.h - this.inset.bottom;
     const k = Math.min(2.4, Math.max(0.05, Math.min((w - pad * 2) / (x1 - x0 || 1), (h - pad * 2) / (y1 - y0 || 1))));
-    const target = { k, tx: w / 2 - ((x0 + x1) / 2) * k, ty: h / 2 - ((y0 + y1) / 2) * k };
+    const target = { k, tx: left + w / 2 - ((x0 + x1) / 2) * k, ty: h / 2 - ((y0 + y1) / 2) * k };
     this.animateTo(target, animate);
   }
 
   /** Space covered by the details panel, so centring targets the part of the map still visible. */
-  inset = { right: 0, bottom: 0 };
+  inset: { right: number; bottom: number; left?: number } = { right: 0, bottom: 0 };
 
   centerOn(n: GNode, minK = 1.6): void {
     this.autoFit = false;
     const k = Math.max(this.k, minK);
-    const cx = (this.w - this.inset.right) / 2, cy = (this.h - this.inset.bottom) / 2;
+    const cx = ((this.inset.left ?? 0) + this.w - this.inset.right) / 2, cy = (this.h - this.inset.bottom) / 2;
     this.animateTo({ k, tx: cx - n.x! * k, ty: cy - n.y! * k }, true);
   }
 
@@ -223,7 +236,7 @@ export class GraphView {
     const slop = 5 / this.k;
     for (const n of this.nodes) {
       const dx = n.x! - x, dy = n.y! - y;
-      const d = Math.sqrt(dx * dx + dy * dy) - n.r;
+      const d = Math.sqrt(dx * dx + dy * dy) - hw(n);
       if (d < slop && d < bestD) { best = n; bestD = d; }
     }
     return best;
@@ -234,6 +247,37 @@ export class GraphView {
     this.selected = n;
     this.refreshHighlight();
     this.invalidate();
+  }
+
+  /** Extra nodes to keep lit with the selection: what an opened agent/service/env var broke down into. */
+  emphasis: (n: GNode) => GNode[] = () => [];
+
+  /** Version-control marks: what the picked commit (or the uncommitted work) added and changed. */
+  private diff: { added: Set<GNode>; changed: Set<GNode> } | null = null;
+  private marked = new Map<GNode, "added" | "changed">();
+
+  setDiff(d: { added: Set<GNode>; changed: Set<GNode> } | null): void {
+    this.diff = d;
+    this.remark();
+    this.invalidate();
+  }
+
+  /** A change inside something folded shows on the nearest thing on screen (its file, its folder). */
+  private remark(): void {
+    this.marked.clear();
+    if (!this.diff) return;
+    const shown = new Set(this.nodes);
+    const put = (n: GNode, how: "added" | "changed") => {
+      let x: GNode | null = n;
+      while (x && !shown.has(x)) x = x.parent;
+      if (!x) return;
+      const lifted = x !== n;
+      if (!this.marked.has(x) || (this.marked.get(x) === "changed" && how === "added" && !lifted)) {
+        this.marked.set(x, lifted ? "changed" : how);
+      }
+    };
+    for (const n of this.diff.changed) put(n, "changed");
+    for (const n of this.diff.added) put(n, "added");
   }
 
   private refreshHighlight(): void {
@@ -247,6 +291,12 @@ export class GraphView {
         this.litLinks.add(l);
         this.lit.add(l.source === focus ? l.target : l.source);
       }
+    }
+    const extra = new Set(this.emphasis(focus));
+    if (extra.size) {
+      for (const n of extra) this.lit.add(n);
+      extra.add(focus);
+      for (const l of this.links) if (extra.has(l.source) && extra.has(l.target)) this.litLinks.add(l);
     }
   }
 
@@ -376,14 +426,23 @@ export class GraphView {
     ctx.scale(k, k);
     const focus = this.selected ?? this.hovered;
     const dim = !!focus;
+    // with changes picked and nothing selected, everything else steps back so the changes stand out
+    const quiet = !dim && this.marked.size > 0;
 
     this.drawRegions(dim);
 
     // links, batched by style
-    const groups: Group[] = ["contains", "imports", "extends", "tests", "calls", "http"];
+    const groups: Group[] = ["contains", "imports", "env", "extends", "tests", "calls", "uses", "runs", "http", "flow"];
     for (const g of groups) {
       const ls = this.links.filter((l) => l.group === g && !this.litLinks.has(l));
       if (!ls.length) continue;
+      if (quiet) {
+        const hot = ls.filter((l) => this.marked.has(l.source) || this.marked.has(l.target));
+        const rest = ls.filter((l) => !(this.marked.has(l.source) || this.marked.has(l.target)));
+        if (rest.length) this.strokeLinks(rest, g, baseAlpha(g) * 0.3, false);
+        if (hot.length) this.strokeLinks(hot, g, Math.min(1, baseAlpha(g) * 1.6), false);
+        continue;
+      }
       this.strokeLinks(ls, g, dim ? 0.08 : baseAlpha(g), false);
     }
     if (this.litLinks.size) {
@@ -397,15 +456,36 @@ export class GraphView {
     for (const kind of SHAPE_ORDER) {
       const ns = this.nodes.filter((n) => n.kind === kind);
       if (!ns.length) continue;
-      const faded = dim ? ns.filter((n) => !this.lit.has(n)) : ns;
-      const strong = dim ? ns.filter((n) => this.lit.has(n)) : [];
-      if (faded.length) this.fillShapes(faded, kind, dim ? 0.22 : 1);
+      const keep = (n: GNode) => (dim ? this.lit.has(n) : quiet ? this.marked.has(n) : true);
+      const faded = dim || quiet ? ns.filter((n) => !keep(n)) : ns;
+      const strong = dim || quiet ? ns.filter(keep) : [];
+      if (faded.length) this.fillShapes(faded, kind, dim ? 0.22 : quiet ? 0.32 : 1);
       if (strong.length) this.fillShapes(strong, kind, 1);
+    }
+    if (this.marked.size) {
+      // green ring: added; amber ring: changed (or holds a change, when its contents are folded)
+      for (const how of ["changed", "added"] as const) {
+        ctx.beginPath();
+        let any = false;
+        for (const [n, h] of this.marked) {
+          if (h !== how || n.x === undefined) continue;
+          const rr = hw(n) * 1.08 + 3.2 / k + 1.2;
+          ctx.moveTo(n.x + rr, n.y!);
+          ctx.arc(n.x, n.y!, rr, 0, Math.PI * 2);
+          any = true;
+        }
+        if (!any) continue;
+        ctx.strokeStyle = how === "added" ? pal.added : pal.changed;
+        ctx.lineWidth = 2.2 / k + 0.5;
+        ctx.globalAlpha = dim ? 0.5 : 1;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
     }
     if (this.selected) {
       const n = this.selected;
       ctx.beginPath();
-      ctx.arc(n.x!, n.y!, Math.max(0.5, n.r + 4 / k), 0, Math.PI * 2);
+      ctx.arc(n.x!, n.y!, Math.max(0.5, hw(n) * 1.08 + 4 / k), 0, Math.PI * 2);
       ctx.strokeStyle = pal.select;
       ctx.lineWidth = 2 / k;
       ctx.stroke();
@@ -419,8 +499,8 @@ export class GraphView {
     ctx.globalAlpha = alpha;
     ctx.strokeStyle = this.pal.edge[g];
     const px = 1 / k;
-    ctx.lineWidth = (g === "http" ? 1.8 : g === "contains" ? 0.8 : lit ? 1.4 : 1) * px * (lit ? 1.3 : 1);
-    ctx.setLineDash(g === "imports" ? [4 * px, 3 * px] : g === "tests" ? [1.2 * px, 2.6 * px] : []);
+    ctx.lineWidth = (g === "http" || g === "flow" ? 1.8 : g === "contains" ? 0.8 : lit ? 1.4 : 1) * px * (lit ? 1.3 : 1);
+    ctx.setLineDash(g === "imports" || g === "runs" ? [4 * px, 3 * px] : g === "tests" || g === "env" ? [1.2 * px, 2.6 * px] : []);
     ctx.beginPath();
     for (const l of ls) {
       const s = l.source, t = l.target;
@@ -434,7 +514,7 @@ export class GraphView {
     ctx.stroke();
     ctx.setLineDash([]);
     // arrowheads where direction matters and they are legible
-    if (g !== "contains" && (lit || k > 1.2) && ls.length < 1500) {
+    if (g !== "contains" && (lit || k > 1.2 || (g === "flow" && k > 0.5)) && ls.length < 1500) {
       ctx.fillStyle = this.pal.edge[g];
       ctx.beginPath();
       for (const l of ls) arrowHead(ctx, l, k);
@@ -444,45 +524,83 @@ export class GraphView {
   }
 
   private fillShapes(ns: GNode[], kind: Kind, alpha: number): void {
+    const byShape = new Map<Shape, GNode[]>();
+    for (const n of ns) {
+      const sh = shapeOf(n);
+      (byShape.get(sh) ?? byShape.set(sh, []).get(sh)!).push(n);
+    }
+    for (const [shape, group] of byShape) this.fillShape(group, kind, shape, alpha);
+  }
+
+  private fillShape(ns: GNode[], kind: Kind, shape: Shape, alpha: number): void {
     const { ctx, k, pal } = this;
     const color = pal.kind[kind];
     ctx.globalAlpha = alpha;
-    const shape = KIND[kind].shape;
-    if (shape === "ring") {
-      ctx.fillStyle = pal.map;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = Math.max(1.4 / k, 1.6);
-      ctx.beginPath();
-      for (const n of ns) { ctx.moveTo(n.x! + n.r, n.y!); ctx.arc(n.x!, n.y!, Math.max(0.5, n.r), 0, Math.PI * 2); }
-      ctx.fill();
-      ctx.stroke();
-      // folded folders get a filled centre: there is more inside
-      const folded = ns.filter((n) => this.collapsed.has(n.id));
-      if (folded.length) {
-        ctx.fillStyle = color;
-        ctx.beginPath();
-        for (const n of folded) { ctx.moveTo(n.x! + n.r * 0.5, n.y!); ctx.arc(n.x!, n.y!, Math.max(0.5, n.r * 0.5), 0, Math.PI * 2); }
-        ctx.fill();
-      }
-      ctx.globalAlpha = 1;
-      return;
-    }
     const external = kind === "ApiEndpoint" ? ns.filter((n) => n.props.defined_in_repo === false) : [];
     const solid = external.length ? ns.filter((n) => n.props.defined_in_repo !== false) : ns;
     ctx.fillStyle = color;
     ctx.beginPath();
-    for (const n of solid) shapePath(ctx, shape, n.x!, n.y!, n.r);
+    for (const n of solid) iconPath(ctx, shape, n.x!, n.y!, n.r);
     ctx.fill();
+    if ((shape === "file" || shape === "folder") && k * 5 > 3) {
+      // a lighter turned corner on pages, a lighter front flap on folders
+      ctx.globalAlpha = alpha * (shape === "file" ? 0.45 : 0.2);
+      ctx.fillStyle = pal.onKind;
+      ctx.beginPath();
+      for (const n of solid) (shape === "file" ? cornerPath : flapPath)(ctx, n.x!, n.y!, n.r);
+      ctx.fill();
+      ctx.globalAlpha = alpha;
+    }
+    if (k * 5 > 3) {
+      // eyes on agents, bays on MCP servers, a lid on databases, the hole in an env-var tag
+      ctx.beginPath();
+      let a = 0;
+      for (const n of solid) a = detailPath(ctx, shape, n.x!, n.y!, n.r) || a;
+      if (a) {
+        ctx.globalAlpha = alpha * a;
+        ctx.fillStyle = pal.onKind;
+        ctx.fill();
+        ctx.globalAlpha = alpha;
+      }
+    }
+    // rings: functions that serve as AI tools, env vars that leak a secret to the browser
+    const tools = kind === "Function" ? solid.filter((n) => n.props.ai_tool) : [];
+    const leaks = kind === "EnvVar" ? solid.filter((n) => n.props.warning) : [];
+    for (const [list, col] of [[tools, pal.kind.Agent], [leaks, pal.warn]] as [GNode[], string][]) {
+      if (!list.length) continue;
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 1.6 / k + 0.6;
+      ctx.beginPath();
+      for (const n of list) {
+        const rr = hw(n) + 2.4;
+        ctx.moveTo(n.x! + rr, n.y!);
+        ctx.arc(n.x!, n.y!, rr, 0, Math.PI * 2);
+      }
+      ctx.stroke();
+    }
     if (external.length) {
       ctx.fillStyle = pal.map;
       ctx.strokeStyle = color;
       ctx.lineWidth = 1.4 / k;
       ctx.setLineDash([2 / k, 1.6 / k]);
       ctx.beginPath();
-      for (const n of external) shapePath(ctx, shape, n.x!, n.y!, n.r);
+      for (const n of external) iconPath(ctx, shape, n.x!, n.y!, n.r);
       ctx.fill();
       ctx.stroke();
       ctx.setLineDash([]);
+    }
+    // marks inside the icons (extension, ƒ, C, +) once they're big enough to read
+    ctx.fillStyle = pal.onKind;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const mono = getMono(), sans = getSans();
+    let lastFont = "";
+    for (const n of solid) {
+      const m = markFor(n, shape, this.collapsed.has(n.id), mono, sans);
+      if (!m || m.size * k < 6.5) continue;
+      const font = fontWithSize(m, m.size);
+      if (font !== lastFont) { ctx.font = font; lastFont = font; }
+      ctx.fillText(m.text, n.x!, n.y! + m.dy);
     }
     ctx.globalAlpha = 1;
   }
@@ -576,9 +694,12 @@ export class GraphView {
       const isLit = this.lit.has(n);
       let show = isLit;
       if (!show && !dim) {
-        if (n.kind === "Folder") show = k > 0.45 && n.depth > (this.regionLabels.length ? 1 : 0);
-        else if (n.kind === "ApiEndpoint") show = k > 0.5;
-        else if (n.kind === "Function") show = k > 1.9 || (k > 1.1 && n.deg > 4);
+        if (n.kind === "Folder") show = (k > 0.45 && n.depth > (this.regionLabels.length ? 1 : 0)) || k > 1.2;
+        else if (n.kind === "GenAI") show = false; // the territory is already labelled
+        else if (n.kind === "ApiEndpoint" || n.kind === "Agent" || n.kind === "McpServer" || n.kind === "ExternalService") show = k > 0.42;
+        else if (n.kind === "AgentStep" || n.kind === "EnvGroup") show = k > 0.7;
+        else if (n.kind === "EnvVar") show = k > 1.2;
+        else if (n.kind === "Function") show = k > 1.9 || (k > 1.1 && n.deg > 4) || !!n.props.ai_tool && k > 0.9;
         else show = k > 1.05 || (k > 0.6 && sr > 5);
       }
       if (!show) continue;
@@ -591,10 +712,10 @@ export class GraphView {
       if (drawn > 260) break;
       const strong = n === this.selected || n === this.hovered;
       const size = strong ? 12.5 : n.kind === "Folder" ? 11.5 : 11;
-      const isCode = n.kind === "Function" || n.kind === "Class" || n.kind === "ApiEndpoint";
+      const isCode = CODE_LABEL.has(n.kind);
       ctx.font = `${strong || n.kind === "Folder" ? 600 : 450} ${size}px ${isCode ? getMono() : font}`;
       const label = labelFor(n);
-      const sx = n.x! * k + this.tx + n.r * k + 4;
+      const sx = n.x! * k + this.tx + hw(n) * k + 5;
       const sy = n.y! * k + this.ty;
       if (sx > this.w + 10 || sy < -10 || sy > this.h + 10 || sx < -200) continue;
       const w = ctx.measureText(label).width;
@@ -609,6 +730,14 @@ export class GraphView {
   }
 }
 
+const hw = (n: GNode) => halfWidth(shapeOf(n), n.r);
+
+let sansCache = "";
+function getSans(): string {
+  if (!sansCache) sansCache = getComputedStyle(document.documentElement).getPropertyValue("--font").trim() || "system-ui";
+  return sansCache;
+}
+
 let monoCache = "";
 function getMono(): string {
   if (!monoCache) monoCache = getComputedStyle(document.documentElement).getPropertyValue("--mono").trim() || "monospace";
@@ -618,33 +747,42 @@ function getMono(): string {
 function labelFor(n: GNode): string {
   if (n.kind === "Function") {
     const q: string = n.props.qualname ?? n.name;
+    if (n.parent?.kind === "Function") return n.name + "()"; // a closure: its outer function adds nothing here
     return (q.includes(".") ? q.split(".").slice(-2).join(".") : q) + "()";
   }
   if (n.kind === "Folder") return n.props.is_root ? n.name : n.name + "/";
+  if (n.kind === "EnvGroup") return `${n.name} (${n.props.count ?? n.children.length})`;
   return n.name;
 }
 
 function baseAlpha(g: Group): number {
-  return { contains: 0.32, calls: 0.42, imports: 0.24, http: 0.85, tests: 0.5, extends: 0.6 }[g];
+  return { contains: 0.32, calls: 0.42, imports: 0.24, http: 0.85, tests: 0.5, extends: 0.6, flow: 0.9, runs: 0.6, uses: 0.32, env: 0.35 }[g];
 }
 
 function linkDistance(l: VLink): number {
   if (l.group === "contains") {
     const s = l.source.kind;
-    if (s === "Function" || s === "ApiEndpoint") return 12 + l.target.r;
+    if (s === "Function" || s === "ApiEndpoint" || s === "EnvVar") return 12 + l.target.r;
     if (s === "Class") return 18 + l.target.r;
-    if (s === "Folder") return 46 + l.source.r + l.target.r;
+    if (s === "AgentStep") return 30 + l.target.r;
+    if (s === "Folder" || s === "GenAI") return 46 + l.source.r + l.target.r;
+    if (s === "Agent" || s === "McpServer" || s === "ExternalService" || s === "EnvGroup") return 34 + l.source.r + l.target.r;
     return 24 + l.target.r;
   }
-  return l.group === "http" ? 140 : 90;
+  if (l.group === "flow") return 40;
+  if (l.group === "runs") return 70;
+  return l.group === "http" || l.group === "uses" ? 140 : 90;
 }
 
 function linkStrength(l: VLink): number {
   switch (l.group) {
-    case "contains": return 0.85;
+    case "contains": return l.source.kind === "AgentStep" ? 0.25 : 0.85;
     case "http": return 0.035;
     case "calls": return l.lifted ? 0.01 : 0.025;
     case "extends": return 0.05;
+    case "flow": return 0.7;
+    case "runs": return l.lifted ? 0.02 : 0.06;
+    case "uses": return 0.015;
     default: return 0.01;
   }
 }
@@ -659,8 +797,8 @@ function arrowHead(ctx: CanvasRenderingContext2D, l: VLink, k: number): void {
   const s = l.source, t = l.target;
   const [cx, cy] = bend(s, t);
   const ang = Math.atan2(t.y! - cy, t.x! - cx);
-  const tipX = t.x! - Math.cos(ang) * (t.r + 1.5 / k);
-  const tipY = t.y! - Math.sin(ang) * (t.r + 1.5 / k);
+  const tipX = t.x! - Math.cos(ang) * (hw(t) * 0.92 + 1.5 / k);
+  const tipY = t.y! - Math.sin(ang) * (hw(t) * 0.92 + 1.5 / k);
   const len = 6 / k, wid = 3 / k;
   ctx.moveTo(tipX, tipY);
   ctx.lineTo(tipX - Math.cos(ang) * len - Math.sin(ang) * wid, tipY - Math.sin(ang) * len + Math.cos(ang) * wid);
@@ -668,38 +806,40 @@ function arrowHead(ctx: CanvasRenderingContext2D, l: VLink, k: number): void {
   ctx.closePath();
 }
 
-export function shapePath(ctx: CanvasRenderingContext2D | Path2D, shape: string, x: number, y: number, r: number): void {
-  switch (shape) {
-    case "square": {
-      const s = r * 0.9, c = r * 0.3;
-      ctx.moveTo(x - s + c, y - s);
-      ctx.arcTo(x + s, y - s, x + s, y + s, c);
-      ctx.arcTo(x + s, y + s, x - s, y + s, c);
-      ctx.arcTo(x - s, y + s, x - s, y - s, c);
-      ctx.arcTo(x - s, y - s, x + s, y - s, c);
-      ctx.closePath();
-      break;
+/** The GenAI layer is a separate territory: move it, as a group, to just outside the code's extent,
+ *  on whichever side it was seeded, so its links fan out instead of piling into the middle. */
+function asideForce() {
+  let nodes: GNode[] = [];
+  let tick = 0;
+  let reach = 0;
+  const force = (alpha: number) => {
+    const ai: GNode[] = [];
+    let cx = 0, cy = 0, cn = 0;
+    for (const n of nodes) {
+      if (n.region?.kind === "GenAI") ai.push(n);
+      else { cx += n.x!; cy += n.y!; cn++; }
     }
-    case "diamond":
-      ctx.moveTo(x, y - r * 1.15);
-      ctx.lineTo(x + r * 1.15, y);
-      ctx.lineTo(x, y + r * 1.15);
-      ctx.lineTo(x - r * 1.15, y);
-      ctx.closePath();
-      break;
-    case "hex":
-      for (let i = 0; i < 6; i++) {
-        const a = Math.PI / 6 + (i * Math.PI) / 3;
-        const px = x + Math.cos(a) * r * 1.1, py = y + Math.sin(a) * r * 1.1;
-        if (i === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
-      }
-      ctx.closePath();
-      break;
-    default:
-      ctx.moveTo(x + r, y);
-      ctx.arc(x, y, Math.max(0.5, r), 0, Math.PI * 2);
-  }
+    if (!ai.length || cn < 8) return;
+    cx /= cn; cy /= cn;
+    if (tick++ % 12 === 0) {
+      const d: number[] = [];
+      for (const n of nodes) if (n.region?.kind !== "GenAI") d.push(Math.hypot(n.x! - cx, n.y! - cy));
+      d.sort((a, b) => a - b);
+      reach = d[Math.floor(d.length * 0.85)] ?? 0;
+    }
+    let ax = 0, ay = 0;
+    for (const n of ai) { ax += n.x!; ay += n.y!; }
+    ax /= ai.length; ay /= ai.length;
+    let ux = ax - cx, uy = ay - cy;
+    const len = Math.hypot(ux, uy) || 1;
+    ux /= len; uy /= len;
+    const want = reach + 110 + Math.sqrt(ai.length) * 18;
+    const k = 0.22 * alpha;
+    const dx = (cx + ux * want - ax) * k, dy = (cy + uy * want - ay) * k;
+    for (const n of ai) { n.vx! += dx; n.vy! += dy; }
+  };
+  force.initialize = (ns: GNode[]) => { nodes = ns; tick = 0; };
+  return force;
 }
 
 /** Pull each node toward the centroid of its top-level folder so territories stay compact and

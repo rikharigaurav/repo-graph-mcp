@@ -22,7 +22,8 @@ def _fmt_counts(c: dict, order: tuple[str, ...] | None = None) -> str:
     return " · ".join(f"{k} {v}" for k, v in items)
 
 
-def summarize(g: CodeGraph, graph_id: str | None, elapsed_s: float, ui_shown: bool, cached: bool) -> str:
+def summarize(g: CodeGraph, graph_id: str | None, elapsed_s: float, ui_shown: bool, cached: bool,
+              history: dict | None = None) -> str:
     """`graph_id=None` omits the MCP follow-up hint (the agent-mode CLI prints its own)."""
     s = g.stats
     labels = s.get("labels", {})
@@ -90,6 +91,9 @@ def summarize(g: CodeGraph, graph_id: str | None, elapsed_s: float, ui_shown: bo
         if len(defined) > 25:
             lines.append(f"  … +{len(defined) - 25} more (search_graph label=ApiEndpoint)")
 
+    lines += _history_section(history)
+    lines += _genai_section(g)
+
     called = Counter()
     for s_, t, r, p in g.edges:
         if r == G.CALLS and g.nodes[t].label in (G.FUNCTION, G.CLASS):
@@ -128,6 +132,96 @@ def summarize(g: CodeGraph, graph_id: str | None, elapsed_s: float, ui_shown: bo
                   "nodes without symbols. Edges are resolved statically (imports, self/this, module instances); "
                   "dynamic dispatch isn't followed."]
     return "\n".join(lines)
+
+
+def _history_section(h: dict | None) -> list[str]:
+    """Branch, what isn't committed or pushed, and what recent commits changed, as graph changes."""
+    if not h:
+        return []
+    up = h.get("upstream")
+    state = []
+    if up:
+        state.append(f"{h['ahead']} commit{'s' if h['ahead'] != 1 else ''} not pushed to {up}" if h.get("ahead")
+                     else f"in sync with {up}")
+        if h.get("behind"):
+            state.append(f"{h['behind']} behind")
+    out = ["", f"Version control: {h.get('branch')} @ {h.get('short')}" + (f" ({', '.join(state)})" if state else "")]
+    for e in h.get("entries", [])[:9]:
+        if e["kind"] == "working":
+            files = ", ".join(f["path"] for f in e["files"][:4]) + (" …" if len(e["files"]) > 4 else "")
+            out.append(f"  Uncommitted ({len(e['files'])} files: {files}): {e['summary']}")
+        else:
+            flag = "" if e.get("pushed") or not up else " [not pushed]"
+            out.append(f"  {e['short']} {e['title'][:70]}{flag}: {e['summary']}")
+    return out
+
+
+def _genai_section(g: CodeGraph) -> list[str]:
+    """Agents, MCP servers, services and env vars, with where they live, for the model's context."""
+    by = {lbl: [n for n in g.nodes.values() if n.label == lbl] for lbl in (G.AGENT, G.MCP_SERVER, G.SERVICE, G.ENV_VAR)}
+    if not any(by.values()):
+        return []
+    out = ["", "GenAI & services (static scan; every link cites file:line, see explore_graph):"]
+    for a in sorted(by[G.AGENT], key=lambda n: (n.path, n.props.get("line", 0))):
+        steps = sorted((g.nodes[s] for s, r in g.in_adj.get(a.id, []) if r == G.BELONGS_TO
+                        and g.nodes[s].label == G.AGENT_STEP), key=lambda n: n.props.get("order", 0))
+        flow = a.props.get("flow") or []
+        chain = _chain(g, steps)
+        desc = chain or "; ".join(flow[:6]) or ", ".join(st.name for st in steps)
+        tools = sorted({g.nodes[t].props.get("tool_name") or g.nodes[t].name
+                        for x in [a.id, *(st.id for st in steps)] for t, r in g.out_adj.get(x, []) if r == G.USES_TOOL})
+        out.append(f"  Agent {a.name} [{a.props.get('framework', '')}] {a.path}:{a.props.get('line', '?')}"
+                   + (f" — {desc}" if desc else "") + (f"; tools: {', '.join(tools[:10])}" if tools else ""))
+        if a.props.get("unresolved"):
+            out.append(f"    not resolved statically: {'; '.join(a.props['unresolved'][:3])}")
+    for m in by[G.MCP_SERVER]:
+        exposed = [g.nodes[t] for t, r in g.out_adj.get(m.id, []) if r == G.EXPOSES]
+        names = [n.props.get("tool_name") or n.name for n in exposed] or m.props.get("tool_names", [])
+        out.append(f"  MCP server {m.name} ({m.path}{', ' + m.props['transport'] if m.props.get('transport') else ''})"
+                   + (f" — exposes: {', '.join(names[:12])}" if names else ""))
+    if by[G.SERVICE]:
+        def sites(n):
+            return sum(1 for _, r in g.in_adj.get(n.id, []) if r == G.USES)
+        svcs = sorted(by[G.SERVICE], key=lambda n: -sites(n))
+        out.append("  Services: " + " · ".join(f"{n.name} [{n.props.get('category', '')}] {sites(n)} use site"
+                                              f"{'' if sites(n) == 1 else 's'}" for n in svcs[:12]))
+    if by[G.ENV_VAR]:
+        env = by[G.ENV_VAR]
+        req = [n.name for n in env if n.props.get("mode") == "required"]
+        out.append(f"  Env vars: {len(env)} read in code" + (f" ({len(req)} required: the app fails without them)" if req else "") + (": " + ", ".join(sorted(n.name for n in env)[:20])
+                                                                                  + (" …" if len(env) > 20 else "") if env else ""))
+        for n in env:
+            if n.props.get("warning"):
+                where = next((f"{p.get('file')}:{p.get('line')}" for (s_, t, r), p in g._edges.items()
+                              if t == n.id and r == G.READS_ENV), "")
+                out.append(f"  Warning: {n.name} ({where}) — {n.props['warning']}")
+    skipped = (g.stats.get("genai") or {}).get("files_skipped_nonprod")
+    if skipped:
+        out.append(f"  ({skipped} files under tests/docs/examples/migrations were not scanned for these.)")
+    return out
+
+
+def _chain(g: CodeGraph, steps: list) -> str:
+    """`a → b → c → END` when the agent is a straight line."""
+    if not steps:
+        return ""
+    ids = {s.id for s in steps}
+    nxt: dict[str, list[str]] = {s.id: [t for t, r in g.out_adj.get(s.id, []) if r == G.NEXT and t in ids] for s in steps}
+    plain = all(g._edges[(s.id, t, G.NEXT)].get("kind") == "edge" for s in steps for t in nxt[s.id])
+    if not plain or any(len(v) > 1 for v in nxt.values()) or any(s.props.get("kind") == "tools" for s in steps):
+        return ""
+    entry = [s for s in steps if s.props.get("entry")]
+    if len(entry) != 1:
+        return ""
+    seq, cur, seen = [], entry[0].id, set()
+    while cur and cur not in seen:
+        seen.add(cur)
+        seq.append(g.nodes[cur].name)
+        cur = nxt[cur][0] if nxt[cur] else None
+    if cur is not None or len(seq) != len(steps):  # loops back, or doesn't reach every step
+        return ""
+    last = next(s for s in steps if s.name == seq[-1])
+    return " → ".join(seq) + (" → END" if last.props.get("can_end") else "")
 
 
 def _count_files(g: CodeGraph, folder_id: str) -> int:
