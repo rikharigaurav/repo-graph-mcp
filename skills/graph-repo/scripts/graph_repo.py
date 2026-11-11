@@ -7,11 +7,14 @@ installed on first use into a private virtualenv (never into your global Python)
     python graph_repo.py build   <repo> [--ref REF] [--path SUBDIR] [--out DIR] [--history N]
     python graph_repo.py explore <DIR> <node> [--depth N] [--direction in|out|both] [--relations CALLS,IMPORTS]
     python graph_repo.py search  <DIR> <query> [--label LABEL] [--limit N]
+    python graph_repo.py live    <folder> [--open] [--port 7333] [--stop]
 
 <repo> is a GitHub URL (incl. /tree/<branch>/<dir> links), owner/repo, any git URL, or a local path.
 `build` writes DIR/graph.html (interactive, self-contained), DIR/graph.json and DIR/summary.txt and prints
 the summary. In a git checkout it also shows uncommitted changes and the last N commits as graph changes;
 each commit's graph is cached by its SHA, so rebuilding after an edit only re-parses the files that changed. `explore` writes DIR/explore-<node>.html focused on one node and prints its relationships.
+`live` serves the view on http://127.0.0.1:7333/ and keeps it current while files change; its Live tab
+lists each change as it happens (labelled with the Claude Code tool that made it, through the plugin's hook).
 """
 
 from __future__ import annotations
@@ -78,14 +81,20 @@ def slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-")[:80] or "graph"
 
 
-def write_view(payload: dict, title: str, dest: Path) -> None:
+def render_page(payload: dict | bytes, title: str) -> str:
+    """The view as one HTML page with the graph inside it."""
     from repo_graph_mcp import __file__ as pkg_file
 
     template = (Path(pkg_file).parent / "ui" / "graph-view.html").read_text("utf8")
-    data = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/").replace("<!--", "<\\!--")
+    raw = payload.decode("utf8") if isinstance(payload, bytes) else json.dumps(payload, separators=(",", ":"))
+    data = raw.replace("</", "<\\/").replace("<!--", "<\\!--")
     inject = f"<script>window.__REPO_GRAPH_PAYLOAD__={data};</script>\n<script>"
     html = template.replace("<script>", inject, 1)
-    html = re.sub(r"<title>.*?</title>", f"<title>{title.replace('<', '')}</title>", html, count=1)
+    return re.sub(r"<title>.*?</title>", lambda _m: f"<title>{title.replace('<', '')}</title>", html, count=1)
+
+
+def write_view(payload: dict, title: str, dest: Path) -> None:
+    html = render_page(payload, title)
     dest.write_text(html, "utf8")
     # Artifact hosts add their own document skeleton (doctype, charset, viewport), so they get the
     # same page without the wrapper: title + styles + body content.
@@ -189,6 +198,76 @@ def cmd_build(args) -> None:
     print(f"Follow-ups:        python {Path(__file__).name} explore \"{out}\" <node>   |   search \"{out}\" <query>")
 
 
+def local_rebuild(folder: Path, commits: int, home: Path, parse_cache):
+    """A function that graphs `folder` as it is on disk now, with its version-control history."""
+    from repo_graph_mcp import fetch as F
+    from repo_graph_mcp import history as H
+    from repo_graph_mcp.builder import build_graph
+    from repo_graph_mcp.store import GraphStore
+
+    spec = F.parse_repo_spec(str(folder))
+    snapshots = H.Snapshots(GraphStore(max_items=4, disk_dir=str(home / "snapshots")))
+    git = commits > 0 and H.is_git(folder)
+
+    def key_for(sha: str) -> str:
+        return f"local:{folder.name}@{sha[:12]}"
+
+    def build(root: Path, info: dict):
+        return build_graph(root, info, parse_cache=parse_cache)
+
+    def rebuild():
+        co = F.local_checkout(spec)
+        info = {"key": key_for(co.sha), "display": spec.display, "name": spec.name or folder.name, "owner": spec.owner,
+                "ref": co.ref, "sha": co.sha, "source": "local", "subpath": "", "built_at": int(time.time())}
+        if git:
+            return H.build_history(co.root, info, key_for, build, snapshots, commits, None, cache_dir=home / "history")
+        return build(co.root, info), None
+
+    return rebuild
+
+
+def cmd_live(args) -> None:
+    from repo_graph_mcp import live as L
+    from repo_graph_mcp.parsecache import ParseCache
+
+    home = cache_dir()
+    folder = Path(args.folder).expanduser().resolve()
+    if not folder.is_dir():
+        sys.exit(f"repo-graph: {folder} isn't a folder. The live view watches a local checkout.")
+    running = L.find_running(home, folder)
+    if args.stop:
+        if running and L.stop_running(running):
+            print(f"repo-graph: stopped the live view of {folder}")
+        else:
+            print(f"repo-graph: no live view is running for {folder}")
+        return
+    if running:
+        print(f"Live view of {folder} is already running: {running['url']}")
+        if args.open:
+            import webbrowser
+            webbrowser.open(running["url"])
+        return
+
+    parse_cache = ParseCache(home / "parses" / f"{slug(str(folder))}.json.gz")
+    print(f"repo-graph: graphing {folder} …", file=sys.stderr)
+    t0 = time.perf_counter()
+    session = L.LiveSession(folder, local_rebuild(folder, max(args.history, 0), home, parse_cache),
+                            interval=args.interval, max_nodes=args.max_nodes, save=parse_cache.save)
+    parse_cache.save()  # the first build parsed everything: keep it for next time
+    server = L.LiveServer(session, lambda payload: render_page(payload, f"{folder.name} · live graph"),
+                          graph_id=f"live:{folder.name}", port=args.port, home=home, idle_minutes=args.idle_minutes)
+    g = session.graph
+    print(f"repo-graph: {len(g.nodes):,} nodes, {g.edge_count:,} links in {time.perf_counter() - t0:.1f} s")
+    print(f"\nLive view: {server.url}")
+    print(f"Watching {folder} for changes (every {session.interval:g} s). Open the Live tab to follow them.")
+    print(f"Stop it with Ctrl+C, or: python {Path(__file__).name} live \"{folder}\" --stop", flush=True)
+    if args.open:
+        import webbrowser
+        webbrowser.open(server.url)
+    server.serve_forever()
+    print("repo-graph: live view stopped", file=sys.stderr)
+
+
 def load_graph(directory: str):
     from repo_graph_mcp.graph import CodeGraph
 
@@ -253,6 +332,16 @@ def main() -> None:
     e.add_argument("--direction", default="both", choices=["both", "in", "out"])
     e.add_argument("--relations", help="comma-separated, e.g. CALLS,IMPORTS")
     e.add_argument("--max-nodes", type=int, default=6000)
+    lv = sub.add_parser("live", help="watch a local folder and show its graph changing as files are edited")
+    lv.add_argument("folder")
+    lv.add_argument("--port", type=int, default=7333, help="port on 127.0.0.1 (default 7333; another if taken)")
+    lv.add_argument("--open", action="store_true", help="open the view in the default browser")
+    lv.add_argument("--interval", type=float, default=1.0, help="seconds between looks at the folder (default 1)")
+    lv.add_argument("--history", type=int, default=8, help="recent commits in the version-control panel")
+    lv.add_argument("--idle-minutes", type=float, default=120,
+                    help="stop after this long with no browser tab open (default 120; 0 = never)")
+    lv.add_argument("--max-nodes", type=int, default=6000)
+    lv.add_argument("--stop", action="store_true", help="stop the live view of this folder")
     s = sub.add_parser("search", help="find nodes by name/path")
     s.add_argument("dir")
     s.add_argument("query")
@@ -260,13 +349,13 @@ def main() -> None:
     s.add_argument("--limit", type=int, default=20)
     args = ap.parse_args()
 
-    if args.cmd == "build":
+    if args.cmd == "build" or (args.cmd == "live" and not args.stop):
         ensure_dependencies()
     sys.path.insert(0, str(HERE))  # the bundled copy of the parser
     from repo_graph_mcp.fetch import FetchError
 
     try:
-        {"build": cmd_build, "explore": cmd_explore, "search": cmd_search}[args.cmd](args)
+        {"build": cmd_build, "explore": cmd_explore, "search": cmd_search, "live": cmd_live}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"repo-graph: {e}")
 

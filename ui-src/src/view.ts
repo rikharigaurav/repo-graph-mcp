@@ -79,12 +79,14 @@ export class GraphView {
   // ── data ────────────────────────────────────────────────────────────────
   setData(nodes: GNode[], links: VLink[], opts: { reseed: boolean }): void {
     const prev = new Set(this.nodes);
+    // after a live reload the nodes are new objects carrying the old positions: keep those in place
+    const prevIds = new Set(this.nodes.map((n) => n.id));
     this.nodes = nodes;
     this.links = links;
     if (opts.reseed) seedRadial(nodes);
     else {
       for (const n of nodes) {
-        if (prev.has(n) && n.x !== undefined) continue;
+        if ((prev.has(n) || prevIds.has(n.id)) && n.x !== undefined) continue;
         const anchor = nearestPlaced(n, prev);
         const a = Math.random() * Math.PI * 2;
         n.x = (anchor?.x ?? 0) + Math.cos(a) * 14;

@@ -6,6 +6,9 @@ import {
 import { drawGlyph } from "./icons";
 import { buildOverview, renderOverview, type OvItem, type Overview, type OverviewHandle } from "./overview";
 import { marksFor, renderChanges, type DiffMarks, type History, type HistoryEntry } from "./changes";
+import {
+  connectLive, fetchGraph, labelOf as liveLabel, renderLive, tickTimes, type LiveEvent, type LiveState, type LiveView,
+} from "./live";
 import { GraphView } from "./view";
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -24,13 +27,20 @@ let view: GraphView | null = null;
 let vis: VisState | null = null;
 let lastInput: Record<string, any> = {};
 let focusLabel = "";
-let mode: "overview" | "map" = "map";
+type Mode = "overview" | "map" | "live";
+let mode: Mode = "map";
 let hasOverview = false;
 let ovHandle: OverviewHandle | null = null;
 let ovModel: Overview | null = null;
 let history: History | null = null;
 let marks: DiffMarks | null = null;
 let changesOpen = false;
+// live view (served by `graph_repo.py live`): the Live tab and the stream behind it
+let liveView: LiveView | null = null;
+let liveStream: { close(): void } | null = null;
+let reloading = false;
+let reloadAgain = false;
+let flashNext: LiveEvent | null = null;
 
 // ── host integration ──────────────────────────────────────────────────────
 function applyHostContext(ctx: HostContext): void {
@@ -153,6 +163,22 @@ function load(payload: Payload): void {
   const working = history?.entries.find((e) => e.kind === "working" && e.diff);
   marks = working ? marksFor(model, working) : null;
   mode = hasOverview && !payload.focus ? "overview" : "map";
+  const live = (payload as any).live as { root: string; name: string; started: string; seq: number; interval: number } | undefined;
+  if (live && !liveStream) {
+    // served live: open on the Live tab, then follow the stream
+    liveView = {
+      state: {
+        root: live.root, name: live.name, started: live.started, seq: live.seq, interval: live.interval, events: [],
+        since: { id: "live-since", kind: "live", title: "Since you started watching", label: "this live session", files: [],
+          diff: null, summary: "no graph changes yet", changes: 0, by_claude: 0, at: live.started },
+        hook_seen: null, building: false, error: null,
+      },
+      conn: "connecting", follow: true, selected: null, fresh: new Set(),
+    };
+    mode = "live";
+    marks = null;
+    startLive();
+  }
   applyMode();
   renderHeader();
   renderLegend();
@@ -168,6 +194,7 @@ function load(payload: Payload): void {
   view.inset = { right: 0, bottom: 0 };
   closePanel();
   closeChanges();
+  applyMode(); // again, now that the view exists: the Live tab keeps room for its panel
   refresh(true);
   applyMarks();
   const focus = payload.focus ? model.byId.get(payload.focus) : null;
@@ -253,43 +280,213 @@ function refresh(reseed = false): void {
 // ── version control ─────────────────────────────────────────────────────────
 function pickEntry(e: HistoryEntry | null): void {
   if (!model) return;
+  if (mode === "live" || (!e && marks?.entry.kind === "live")) { pickLive(e); return; }
   marks = e ? marksFor(model, e) : null;
   applyMarks();
 }
 
-/** Put the picked entry's marks on the overview rows and the map, and refresh the chip and panel. */
+/** Change counts per overview row ([added, changed, removed]) for one entry. */
+function rowCounts(e: HistoryEntry): Map<OvItem, [number, number, number]> {
+  const counts = new Map<OvItem, [number, number, number]>();
+  const ov = ovModel;
+  const d = e.diff;
+  if (!ov || !model || !d) return counts;
+  const symbolPaths = new Set([...d.added, ...d.changed, ...d.removed]
+    .filter((r) => !/File$/.test(r.l)).map((r) => r.p));
+  ([[d.added, 0], [d.changed, 1], [d.removed, 2]] as const).forEach(([list, i]) => {
+    for (const r of list) {
+      if (/File$/.test(r.l) && i === 1 && symbolPaths.has(r.p)) continue; // its functions say it better
+      const n = model!.byId.get(r.id);
+      const it = (n && ov.itemOf(n)) || ov.itemOfPath(r.p);
+      if (!it) continue;
+      const c = counts.get(it) ?? [0, 0, 0];
+      c[i]++;
+      counts.set(it, c);
+    }
+  });
+  return counts;
+}
+
+function bannerLabel(e: HistoryEntry): string {
+  if (e.kind === "working") return "uncommitted work";
+  if (e.kind === "live") return e.label ?? liveLabel(e as LiveEvent);
+  return `${e.short} ${e.title}`;
+}
+
+/** Put the picked entry's marks on the overview rows and the map, and refresh the chip and panels. */
 function applyMarks(): void {
   if (!model) return;
   view?.setDiff(marks ? { added: marks.added, changed: marks.changed } : null);
   if (ovHandle && ovModel) {
-    const ov = ovModel;
     if (!marks || !marks.entry.diff) ovHandle.mark(null);
     else {
-      const counts = new Map<OvItem, [number, number, number]>();
-      const d = marks.entry.diff;
-      const symbolPaths = new Set([...d.added, ...d.changed, ...d.removed]
-        .filter((r) => !/File$/.test(r.l)).map((r) => r.p));
-      ([[d.added, 0], [d.changed, 1], [d.removed, 2]] as const).forEach(([list, i]) => {
-        for (const r of list) {
-          if (/File$/.test(r.l) && i === 1 && symbolPaths.has(r.p)) continue; // its functions say it better
-          const n = model!.byId.get(r.id);
-          const it = (n && ov.itemOf(n)) || ov.itemOfPath(r.p);
-          if (!it) continue;
-          const c = counts.get(it) ?? [0, 0, 0];
-          c[i]++;
-          counts.set(it, c);
-        }
-      });
       const e = marks.entry;
-      ovHandle.mark(counts, {
-        label: e.kind === "working" ? "uncommitted work" : `${e.short} ${e.title}`,
-        detail: e.summary,
-        onClear: () => pickEntry(null),
-      });
+      ovHandle.mark(rowCounts(e), { label: bannerLabel(e), detail: e.summary, onClear: () => pickEntry(null) });
     }
   }
   renderVcChip();
   if (changesOpen) drawChanges();
+  drawLive();
+}
+
+// ── live ──────────────────────────────────────────────────────────────────
+function startLive(): void {
+  liveStream = connectLive({
+    hello: (s: LiveState) => {
+      if (!liveView) return;
+      const behind = s.seq !== liveView.state.seq; // changes happened while we were away (or the server restarted)
+      const selId = liveView.selected?.entry.id ?? "live-since";
+      liveView.state = s;
+      liveView.conn = "open";
+      if (behind) void reloadGraph();
+      else repickLive(selId);
+    },
+    change: (ev, since, seq) => {
+      if (!liveView) return;
+      const st = liveView.state;
+      if (ev) {
+        st.events = [ev, ...st.events.filter((e) => e.id !== ev.id)].slice(0, 200);
+        liveView.fresh.add(ev.id);
+        if (liveView.follow) flashNext = ev;
+      }
+      st.since = since;
+      st.seq = seq;
+      st.building = false;
+      st.error = null;
+      void reloadGraph();
+    },
+    update: (ev, since) => {
+      if (!liveView) return;
+      const st = liveView.state;
+      st.events = st.events.map((e) => (e.id === ev.id ? ev : e));
+      st.since = since;
+      repickLive(liveView.selected?.entry.id ?? null);
+    },
+    status: (building, error) => {
+      if (!liveView) return;
+      liveView.state.building = building;
+      liveView.state.error = error;
+      drawLive();
+    },
+    hook: (seen) => {
+      if (!liveView) return;
+      liveView.state.hook_seen = seen;
+      drawLive();
+    },
+    connection: (c) => {
+      if (!liveView) return;
+      liveView.conn = c;
+      drawLive();
+    },
+  });
+  setInterval(() => { if (mode === "live") tickTimes($("#live")); }, 5000);
+}
+
+/** Fetch the newest graph; changes that arrive meanwhile are folded into one more fetch. */
+async function reloadGraph(): Promise<void> {
+  if (reloading) { reloadAgain = true; return; }
+  reloading = true;
+  try {
+    do {
+      reloadAgain = false;
+      reloadInPlace(await fetchGraph());
+    } while (reloadAgain);
+  } catch (e) {
+    if (liveView) { liveView.state.error = (e as Error).message; drawLive(); }
+  } finally {
+    reloading = false;
+  }
+}
+
+/** Swap in a new graph and keep everything the user set up: tab, filters, folds, focus, selection, positions. */
+function reloadInPlace(payload: Payload): void {
+  if (!model || !vis || !view) { load(payload); return; }
+  const old = new Map(model.nodes.map((n) => [n.id, n]));
+  const selId = view.selected?.id ?? null;
+  model = new Model(payload);
+  for (const n of model.nodes) {
+    const o = old.get(n.id);
+    if (o && o.x !== undefined) { n.x = o.x; n.y = o.y; n.vx = 0; n.vy = 0; }
+  }
+  const has = (id: string) => model!.byId.has(id);
+  const keep = (s: Set<string>) => new Set([...s].filter(has));
+  vis.expanded = keep(vis.expanded);
+  vis.collapsed = keep(vis.collapsed);
+  vis.opened = keep(vis.opened);
+  if (vis.focus) vis.focus = keep(vis.focus);
+  ovHandle?.destroy();
+  ovHandle = null;
+  ovModel = buildOverview(model);
+  hasOverview = payload.mode !== "explore" && ovModel.itemCount >= 2;
+  if (hasOverview) {
+    ovHandle = renderOverview($("#overview"), ovModel, String(payload.repo?.name ?? model.repoLabel), {
+      glyph: (k, n) => glyph(k, n),
+      open: (it) => openItem(it),
+    });
+  }
+  history = ((payload as any).history as History | undefined) ?? null;
+  if (liveView && (payload as any).live) liveView.state.seq = (payload as any).live.seq;
+  refresh(false);
+  const sel = selId ? model.byId.get(selId) : null;
+  if (sel) { view.select(sel); if (!$("#panel").hidden) openPanel(sel); } else if (selId) select(null, false);
+  applyMode();
+  // what's marked: the newest change when following, otherwise whatever was picked before
+  const ev = flashNext;
+  flashNext = null;
+  if (ev && liveView?.follow) repickLive(ev.id);
+  else if (marks?.entry.kind === "live") repickLive(marks.entry.id);
+  else if (marks) {
+    const again = history?.entries.find((e) => e.id === marks!.entry.id);
+    marks = again ? marksFor(model, again) : null;
+    applyMarks();
+  } else applyMarks();
+  if (ev && ovHandle) ovHandle.flash(rowCounts(ev).keys());
+  renderHeader();
+}
+
+function liveEntry(id: string | null): HistoryEntry | null {
+  if (!liveView || !id) return null;
+  const st = liveView.state;
+  return id === st.since.id ? st.since : st.events.find((e) => e.id === id) ?? null;
+}
+
+function repickLive(id: string | null): void {
+  if (!model || !liveView) return;
+  const e = liveEntry(id);
+  liveView.selected = e ? marksFor(model, e) : null;
+  if (mode === "live" || marks?.entry.kind === "live") marks = liveView.selected;
+  applyMarks();
+}
+
+function pickLive(e: HistoryEntry | null): void {
+  if (!liveView) return;
+  // picking anything but the newest change stops following
+  const newest = liveView.state.events[0]?.id;
+  if (e && e.id !== newest) liveView.follow = false;
+  if (!e) liveView.follow = false;
+  marks = null;
+  liveView.selected = null;
+  repickLive(e?.id ?? null);
+}
+
+function setFollow(on: boolean): void {
+  if (!liveView) return;
+  liveView.follow = on;
+  if (on) repickLive(liveView.state.events[0]?.id ?? "live-since");
+  else drawLive();
+}
+
+function drawLive(): void {
+  if (mode !== "live" || !liveView || !model) return;
+  renderLive($("#live"), liveView, model, {
+    glyph: (k, n) => glyph(k, n),
+    pick: (e) => pickLive(e),
+    openNode: (n) => { setMode("map"); select(n, true); },
+    openLink: (url) => void openLink(url),
+    showInMap: () => showChangesInMap(),
+    setFollow: (on) => setFollow(on),
+  });
+  liveView.fresh.clear();
 }
 
 function renderVcChip(): void {
@@ -323,6 +520,7 @@ function drawChanges(): void {
 
 function openChanges(): void {
   if (!history) return;
+  if (mode === "live") setMode(hasOverview ? "overview" : "map"); // both panels sit on the left
   changesOpen = true;
   const narrow = window.matchMedia("(max-width: 640px)").matches;
   if (narrow) closePanel();
@@ -355,7 +553,10 @@ function showChangesInMap(): void {
   for (const n of marks.affected) keep.add(n.id);
   for (const id of [...keep]) for (let a = model.byId.get(id)?.parent; a; a = a.parent) { keep.add(a.id); vis.collapsed.delete(a.id); }
   vis.focus = keep;
-  focusLabel = marks.entry.kind === "working" ? "uncommitted changes" : `changes in ${marks.entry.short}`;
+  const e = marks.entry;
+  focusLabel = e.kind === "working" ? "uncommitted changes" : e.kind === "live"
+    ? (e.id === "live-since" ? "changes in this live session" : `changes from ${e.title.replace(/^Edited /, "")}`)
+    : `changes in ${e.short}`;
   setMode("map");
   select(null, false);
   renderHeader();
@@ -364,20 +565,33 @@ function showChangesInMap(): void {
 
 // ── overview ⇄ map ────────────────────────────────────────────────────────
 function applyMode(): void {
-  $("#overview").hidden = mode !== "overview";
-  $("#app").dataset.mode = mode;
-  $("#modes").hidden = !hasOverview;
+  const isLive = mode === "live";
+  // the Live tab shows the overview (or the map, for a repo too small for one) with the changes beside it
+  const showsOverview = mode === "overview" || (isLive && hasOverview);
+  $("#overview").hidden = !showsOverview;
+  $("#app").dataset.mode = showsOverview ? "overview" : "map";
+  $("#app").dataset.tab = mode;
+  $("#modes").hidden = !hasOverview && !liveView;
   document.querySelectorAll<HTMLButtonElement>("#modes button").forEach((b) => {
-    b.setAttribute("aria-selected", String(b.dataset.mode === mode));
+    const m = b.dataset.mode as Mode;
+    b.hidden = (m === "overview" && !hasOverview) || (m === "live" && !liveView);
+    b.setAttribute("aria-selected", String(m === mode));
   });
+  const narrow = window.matchMedia("(max-width: 640px)").matches;
+  $("#live").hidden = !isLive;
+  $("#app").classList.toggle("live-open", isLive && !narrow);
+  if (view) view.inset = { ...view.inset, left: (isLive || changesOpen) && !narrow ? 360 : 0 };
   $("#scope-overview").hidden = !hasOverview;
   renderHeader();
+  drawLive();
 }
 
-function setMode(m: "overview" | "map"): void {
+function setMode(m: Mode): void {
   if (m === mode) return;
-  if (m === "overview") select(null, false);
+  if (m !== "map") select(null, false);
+  if (m === "live" && changesOpen) closeChanges();
   mode = m;
+  if (m === "live" && liveView && !marks) repickLive(liveView.selected?.entry.id ?? "live-since");
   applyMode();
 }
 
@@ -928,7 +1142,7 @@ function wire(): void {
   $("#scope-overview").onclick = () => setMode("overview");
   $("#vc").onclick = () => (changesOpen ? closeChanges() : openChanges());
   document.querySelectorAll<HTMLButtonElement>("#modes button").forEach((b) => {
-    b.onclick = () => setMode(b.dataset.mode as "overview" | "map");
+    b.onclick = () => setMode(b.dataset.mode as Mode);
   });
   $("#fullscreen").onclick = async () => {
     const next = bridge.hostContext.displayMode === "fullscreen" ? "inline" : "fullscreen";

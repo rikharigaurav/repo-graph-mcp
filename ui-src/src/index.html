@@ -22,6 +22,7 @@
       <div id="modes" class="seg" role="tablist" aria-label="View" hidden>
         <button type="button" role="tab" data-mode="overview">Overview</button>
         <button type="button" role="tab" data-mode="map">Map</button>
+        <button type="button" role="tab" data-mode="live" hidden><span class="live-tab-dot" aria-hidden="true"></span>Live</button>
       </div>
       <div class="search-wrap">
         <input id="search" type="search" placeholder="Find a file, function or route" autocomplete="off" spellcheck="false"
@@ -43,6 +44,7 @@
     <div id="tip" class="tip" hidden></div>
     <aside id="panel" class="panel" aria-label="Node details" hidden></aside>
     <aside id="changes" class="panel changes-panel" aria-label="Changes" hidden></aside>
+    <aside id="live" class="panel changes-panel live-panel" aria-label="Live changes" hidden></aside>
     <div class="zoom" role="group" aria-label="Zoom">
       <button id="zoom-in" type="button" aria-label="Zoom in">+</button>
       <button id="zoom-out" type="button" aria-label="Zoom out">&minus;</button>

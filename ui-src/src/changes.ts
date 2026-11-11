@@ -13,8 +13,10 @@ export interface Diff {
 }
 export interface HistoryEntry {
   id: string;
-  kind: "working" | "commit";
+  kind: "working" | "commit" | "live";
   title: string;
+  /** What the overview banner calls it ("Changes from …"). */
+  label?: string;
   sha?: string;
   short?: string;
   author?: string;
@@ -162,21 +164,23 @@ export function renderChanges(host: HTMLElement, h: History, model: Model, selec
   host.append(head, body);
 }
 
-function details(m: DiffMarks, model: Model, cb: ChangesCallbacks): HTMLElement {
+export function details(m: DiffMarks, model: Model, cb: Pick<ChangesCallbacks, "glyph" | "openNode" | "openLink" | "showInMap">): HTMLElement {
   const box = el("div", "vc-details");
   const e = m.entry;
   if (e.summary) box.append(el("p", "vc-summary", e.summary));
   const actions = el("div", "panel-actions");
-  const map = el("button", "btn", "Show these in the map");
-  map.onclick = () => cb.showInMap();
-  actions.append(map);
+  if (m.added.size || m.changed.size) {
+    const map = el("button", "btn", "Show these in the map");
+    map.onclick = () => cb.showInMap();
+    actions.append(map);
+  }
   if (e.url) {
     const gh = el("button", "btn", "Open on GitHub");
     gh.onclick = () => cb.openLink(e.url!);
     actions.append(gh);
   }
   box.append(actions);
-  if (!e.diff) {
+  if (!e.diff && e.kind === "commit") {
     box.append(el("p", "panel-note", "This commit's graph couldn't be built, so only its files are listed."));
   }
   const section = (titleText: string, items: { label: string; kind: Kind; node?: GNode; where?: string; cls: string; note?: string }[]) => {

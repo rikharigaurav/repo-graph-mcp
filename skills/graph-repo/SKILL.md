@@ -6,9 +6,10 @@ description: >
   architecture", "how is this repo organised", "what calls X", "which tests cover Y", "where is endpoint Z
   handled", "what does the agent do", "which code uses the LLM / vector DB", "what env vars does it need",
   or invokes /graph-repo. It builds a structural graph of the code, including its AI agents, MCP servers,
-  external services and env vars, and shows it interactively.
+  external services and env vars, and shows it interactively. Also use it when the user wants to "watch
+  the graph live", "see the changes as Claude edits", or "show the live graph" of a local folder.
 metadata:
-  version: "0.5.0"
+  version: "0.6.0"
 ---
 
 # Graph a repository
@@ -88,6 +89,25 @@ chip opens the same timeline. Use it when the user asks what changed, what a com
 pushed, or to review work in progress, including edits you just made: run `build` again after editing.
 It's fast (snapshots per commit SHA and parses per file content are cached), so rebuild freely and
 republish the page to show the latest state.
+
+## Live view
+
+When the user wants to watch the graph change while code is being edited (by you or by them), start the
+live server for their **local** folder. It keeps running, so start it in the background (in Claude Code:
+the Bash tool with `run_in_background`), never in the foreground:
+
+```
+PY "<skill dir>/scripts/graph_repo.py" live "<folder>" --open
+```
+
+It prints `Live view: http://127.0.0.1:7333/` (another port if that one is taken) and `--open` opens it in
+the default browser. Give the user that URL and tell them to keep the page open on its **Live** tab:
+each change shows up there within a second or two, with what it added, changed and removed, and the
+overview rows it touched light up. Your own Edit/Write changes are labelled "Claude Code" through this
+plugin's hook; nothing else is needed. Running the same command again reuses a server that's already
+watching that folder. Stop it with `PY "<skill dir>/scripts/graph_repo.py" live "<folder>" --stop`.
+
+It only watches folders on the machine where it runs: for a GitHub URL, clone it first or use `build`.
 
 ## Reading the graph
 

@@ -33,6 +33,8 @@ export interface OverviewHandle {
   destroy(): void;
   /** Change counts per row ([added, changed, removed]) and the banner saying what they're from. */
   mark(counts: Map<OvItem, [number, number, number]> | null, banner?: { label: string; detail: string; onClear(): void }): void;
+  /** Briefly light up rows that just changed (live view). */
+  flash(items: Iterable<OvItem>): void;
 }
 
 const CODE = new Set<Kind>(["DataFile", "TemplateMarkupFile"]);
@@ -483,5 +485,22 @@ export function renderOverview(host: HTMLElement, ov: Overview, repoName: string
     }
     requestAnimationFrame(layout);
   }
-  return { destroy: () => ro.disconnect(), mark };
+  function flash(items: Iterable<OvItem>): void {
+    let first: HTMLElement | null = null;
+    for (const it of items) {
+      const row = rowEl.get(it);
+      if (!row) continue;
+      row.classList.remove("is-flash");
+      void row.offsetWidth; // restart the animation
+      row.classList.add("is-flash");
+      setTimeout(() => row.classList.remove("is-flash"), 2200);
+      first ??= row;
+    }
+    // bring a changed row into view when it's scrolled away
+    if (first) {
+      const r = first.getBoundingClientRect(), h = host.getBoundingClientRect();
+      if (r.top < h.top || r.bottom > h.bottom) first.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }
+  return { destroy: () => ro.disconnect(), mark, flash };
 }

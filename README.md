@@ -120,6 +120,39 @@ parse by a hash of its bytes, in the repo-graph cache folder:
 Old commits are read with `git archive` into a temporary folder: the repository is never modified and
 nothing is fetched from the network for local repos.
 
+### Live view: watch the graph change while Claude Code works
+
+![The Live tab: each change as it happens, labelled with the Claude Code tool that made it](docs/graph-live.png)
+
+Point it at a local folder and keep the page open beside Claude Code:
+
+```
+python skills/graph-repo/scripts/graph_repo.py live <folder> --open
+```
+
+or just ask Claude: "show me the live graph of this repo". It serves the view on
+`http://127.0.0.1:7333/` and opens on a **Live** tab next to Overview and Map:
+
+- every change appears within a second or two: what it added, changed and removed (functions, endpoints,
+  services, env vars) and which files it touched;
+- edits Claude Code makes are labelled **Claude Code · Edit** (or Write, MultiEdit, NotebookEdit); other
+  edits show as **File change**, and commits as **Commit**;
+- "Since you started watching" sums up the whole session; the overview rows a change touched light up,
+  and the map rings its nodes. Turn off "Show each new change as it arrives" to stay on one change;
+- the graph updates in place: your tab, filters, folds, focus and selection stay as they were.
+
+How it works: the server checks the folder's files (size and modification time) every second, waits for a
+burst of writes to finish, rebuilds the graph (only changed files are parsed again, so this takes well
+under a second) and pushes the difference to the page. The plugin's `PostToolUse` hook
+(`hooks/hooks.json`) tells the server which file Claude just edited, which is how changes get Claude
+Code's label and show up without waiting for the next check. With no live view running, the hook does
+nothing.
+
+It listens on 127.0.0.1 only, answers only requests addressed to localhost, and the hook needs a token
+from a lock file in your cache folder. Stop it with Ctrl+C or `live <folder> --stop`; it also stops by
+itself after 2 hours with no tab open (`--idle-minutes`). Running `live` again for the same folder reuses
+the server that's already running.
+
 ## MCP tools (MCP mode)
 
 | Tool | Shown to | What it does |
@@ -160,8 +193,8 @@ In Claude Code:
 
 In the Claude app, add the marketplace `rikharigaurav/repo-graph-mcp` and install `repo-graph`.
 
-That's all. The plugin contains only a skill (`graph-repo`), an agent (`repo-grapher`) and the bundled
-builder, so there's no server to start. You need Python 3.10+ and git wherever Claude runs code. On first
+That's all. The plugin contains a skill (`graph-repo`), an agent (`repo-grapher`), the bundled builder and
+one hook that feeds the optional live view, so there's no server to start. You need Python 3.10+ and git wherever Claude runs code. On first
 use the builder installs tree-sitter into a private environment in your cache folder
 (`%LOCALAPPDATA%\repo-graph` on Windows, `~/.cache/repo-graph` elsewhere), never into your global Python.
 
@@ -286,6 +319,8 @@ repo's nodes.
 6. **Version control** (`history.py`, `parsecache.py`): in a git checkout, the uncommitted changes and
    the last N commits as graph diffs; graphs saved per commit SHA, parses per file content hash.
 7. **Deliver**: summary to the model, graph to the view, cached by commit.
+8. **Live** (`live.py`, optional): a local server that rebuilds on every change and streams the
+   difference to the view (Server-Sent Events); Claude Code's hook labels the changes Claude made.
 
 Limits: only Python and JS/TS are parsed into symbols (other languages show as files). Dynamic dispatch,
 dependency injection and reflection aren't followed. Route matching is static, so routes built at
