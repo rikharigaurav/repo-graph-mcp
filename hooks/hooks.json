@@ -1,5 +1,5 @@
 {
-  "description": "repo-graph live view: when Claude edits a file, tell a running live view (graph_repo.py live) so the change shows at once, labelled with the tool that made it. Does nothing when no live view is running.",
+  "description": "repo-graph live view: when Claude edits a file, tell a running live view (graph_repo.py live) so the change shows at once, labelled with the tool that made it; before each prompt, tell Claude which of its changes the user undid in the live view. Both do nothing when no live view is running.",
   "hooks": {
     "PostToolUse": [
       {
@@ -10,6 +10,17 @@
             "command": "S=\"${CLAUDE_PLUGIN_ROOT}/skills/graph-repo/scripts/live_notify.py\"; IN=$(cat); for P in python3 python py; do command -v $P >/dev/null 2>&1 && printf '%s' \"$IN\" | $P \"$S\" 2>/dev/null && break; done; true",
             "async": true,
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "S=\"${CLAUDE_PLUGIN_ROOT}/skills/graph-repo/scripts/live_notify.py\"; IN=$(cat); for P in python3 python py; do command -v $P >/dev/null 2>&1 && printf '%s' \"$IN\" | $P \"$S\" --context 2>/dev/null && break; done; true",
+            "timeout": 5
           }
         ]
       }

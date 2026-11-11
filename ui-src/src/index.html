@@ -23,6 +23,7 @@
         <button type="button" role="tab" data-mode="overview">Overview</button>
         <button type="button" role="tab" data-mode="map">Map</button>
         <button type="button" role="tab" data-mode="live" hidden><span class="live-tab-dot" aria-hidden="true"></span>Live</button>
+        <button type="button" role="tab" data-mode="ui" hidden title="Your app, and the changes to accept or undo">UI</button>
       </div>
       <div class="search-wrap">
         <input id="search" type="search" placeholder="Find a file, function or route" autocomplete="off" spellcheck="false"
@@ -40,6 +41,7 @@
   <main class="stage">
     <div id="canvas" class="canvas"></div>
     <div id="overview" class="overview" hidden></div>
+    <section id="appview" class="appview" aria-label="Your app and the changes to review" hidden></section>
     <div id="state" class="state"></div>
     <div id="tip" class="tip" hidden></div>
     <aside id="panel" class="panel" aria-label="Node details" hidden></aside>

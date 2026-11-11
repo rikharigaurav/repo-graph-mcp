@@ -155,6 +155,44 @@ from a lock file in your cache folder. Stop it with Ctrl+C or `live <folder> --s
 itself after 2 hours with no tab open (`--idle-minutes`). Running `live` again for the same folder reuses
 the server that's already running.
 
+### UI tab: your app, live, with each change to accept or undo
+
+![The UI tab: the app hot-reloading with Claude Code's edit, and the review with its diff](docs/graph-ui.png)
+
+The live view has a fourth tab, **UI**. It runs your repo's own frontend and shows it beside a review
+of every file that changed since you started watching:
+
+- **Your app, live.** Click "Start the app" (or pass `--ui`). It finds the frontend itself: the
+  package.json with a `dev` script for Vite, Next.js, Create React App, Vue, Nuxt, Svelte(Kit), Astro,
+  Angular, Remix or Gatsby, run with npm, pnpm, yarn or bun to match the lock file, installing
+  dependencies first if they're missing. A folder with only an `index.html` is served as a static site.
+  The app's hot reload shows each edit as it lands. Switch between desktop, tablet and phone widths;
+  "Output" shows the dev server's log.
+- **Review.** Each changed file, with who changed it (**Claude Code · Edit**, **File change** or **Git**),
+  `+added −removed` lines and the diff. **Accept** keeps the change. **Undo** puts the file back as it
+  was, deleting a file that was created or recreating one that was deleted; the app reloads with it.
+  **Bring back** restores something you undid. "Accept all" and "Undo all" do every file at once.
+- **Claude Code hears about it.** Before your next message, the plugin's `UserPromptSubmit` hook tells
+  Claude which of its changes you undid, so it re-reads those files and doesn't redo them.
+
+For other kinds of app, give the command and, if it doesn't print its address, the URL:
+
+```
+python skills/graph-repo/scripts/graph_repo.py live . --ui-cmd "streamlit run app.py"
+python skills/graph-repo/scripts/graph_repo.py live . --ui-dir frontend --ui
+python skills/graph-repo/scripts/graph_repo.py live . --ui-cmd "python manage.py runserver" --ui-url http://localhost:8000
+```
+
+What's reviewed: source files, templates, styles, JSON/YAML/TOML config, SVG and SQL up to 1 MB. Never
+`.env` files, lock files, logs or anything in `node_modules`, build output or hidden folders. The review
+starts from the files as they were when you started watching (kept in memory, nothing is written to
+the repo or to git). Accepting doesn't commit; commit as usual when you're happy. Stopping the live view
+stops the app too.
+
+Running the app means running the repo's own `dev` script, with the same trust as running it yourself.
+The page's buttons work only from the page the server served (a per-session token), and only on files
+inside the watched folder.
+
 ## MCP tools (MCP mode)
 
 | Tool | Shown to | What it does |

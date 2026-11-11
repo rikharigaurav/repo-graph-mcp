@@ -9,9 +9,16 @@ overview and the map.
 
 Claude Code's PostToolUse hook (hooks/hooks.json → scripts/live_notify.py) posts the path of every
 file Claude edits to /api/notify. Those changes are labelled with the tool that made them, and they show
-up without waiting for the next poll. Only this machine can reach the server: it listens on 127.0.0.1,
-answers only requests addressed to localhost, and /api/notify and /api/stop need the token from the
-lock file, which only the user's own account can read.
+up without waiting for the next poll.
+
+The UI tab runs the repo's own frontend (apprunner.py) beside a review of every changed file
+(review.py): accept keeps a change, undo restores the file. Undos are handed to Claude Code by the
+UserPromptSubmit hook (/api/feedback), so it doesn't redo them.
+
+Only this machine can reach the server: it listens on 127.0.0.1 and answers only requests addressed to
+localhost. /api/notify, /api/feedback and /api/stop need the token from the lock file, which only the
+user's own account can read; the page's own actions (accept, undo, start the app) need the token the
+page was served with.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ import queue
 import secrets
 import threading
 import time
+import urllib.parse
 import urllib.request
 from collections import deque
 from datetime import datetime, timezone
@@ -34,6 +42,7 @@ from typing import Any, Callable
 from .classify import classify, is_ignored_dir
 from .graph import CodeGraph
 from .history import describe_counts, diff_graphs
+from .review import Review, message_for_claude, reviewable, transient
 
 log = logging.getLogger("repo_graph_mcp")
 
@@ -104,8 +113,13 @@ def stop_running(lock: dict[str, Any]) -> bool:
 
 # ── watching the folder ──────────────────────────────────────────────────────
 
+def in_graph(rel: str) -> bool:
+    """Files the graph is built from: a change to one of these means a rebuild."""
+    return rel.rsplit("/", 1)[-1] in CONFIG_FILES or classify(rel) is not None
+
+
 class Scanner:
-    """Size and mtime of every file the graph shows (the builder's own rules), and git's HEAD."""
+    """Size and mtime of every file the graph shows or a review covers (styles, JSON…), and git's HEAD."""
 
     def __init__(self, root: Path):
         self.root = root
@@ -120,7 +134,7 @@ class Scanner:
             rel_dir = "" if rel_dir == "." else rel_dir
             for fn in filenames:
                 rel = f"{rel_dir}/{fn}" if rel_dir else fn
-                if fn not in CONFIG_FILES and classify(rel) is None:
+                if transient(rel) or not (in_graph(rel) or reviewable(rel)):
                     continue
                 try:
                     st = os.stat(os.path.join(dirpath, fn))
@@ -179,6 +193,24 @@ def _has_changes(d: dict[str, Any] | None) -> bool:
     return bool(d and (d["added"] or d["changed"] or d["removed"]))
 
 
+def _who_changed(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per file, the latest change to it: Claude Code (with the tool), the disk, or git."""
+    who: dict[str, dict[str, Any]] = {}
+    for ev in events:  # oldest first, so the latest wins
+        if ev["source"] == "review":
+            continue
+        claude = ev.get("claude") or {}
+        for f in ev["files"]:
+            p = f["path"]
+            source = "claude" if p in claude else ("git" if ev["source"] == "git" else "disk")
+            who[p] = {"source": source, "tools": [claude[p]] if p in claude else [], "at": ev["at"], "event": ev["id"]}
+    return who
+
+
+def _no_diff() -> dict[str, Any]:
+    return {"added": [], "changed": [], "removed": [], "counts": {}, "links": {"added": 0, "removed": 0}}
+
+
 # ── one watched folder ───────────────────────────────────────────────────────
 
 class LiveSession:
@@ -212,6 +244,9 @@ class LiveSession:
 
         self.files = self.start_files = self.scanner.snapshot()
         self.git_state = self.scanner.git_sig()
+        self.review = Review(self.root, self.files)  # the baseline that changes are accepted or undone against
+        self.page_token = secrets.token_urlsafe(18)  # the page's own actions (accept, undo, start the app)
+        self.app: Any = None  # the AppRunner, when the server has one
         self.graph, self.history = rebuild()
         self.start_graph = self.graph
 
@@ -224,7 +259,7 @@ class LiveSession:
                 if self.history:
                     p["history"] = self.history
                 p["live"] = {"root": str(self.root), "name": self.root.name, "started": self.started,
-                             "seq": self.graph_seq, "interval": self.interval}
+                             "seq": self.graph_seq, "interval": self.interval, "token": self.page_token}
                 self._payload = json.dumps(p, separators=(",", ":")).encode("utf8")
             return self._payload
 
@@ -245,9 +280,45 @@ class LiveSession:
 
     def hello(self) -> dict[str, Any]:
         with self.lock:
-            return {"root": str(self.root), "name": self.root.name, "started": self.started, "seq": self.graph_seq,
-                    "events": list(self.events)[::-1][:100], "since": self.since(), "hook_seen": self.hook_seen,
-                    "building": self.building, "error": self.error, "interval": self.interval}
+            out = {"root": str(self.root), "name": self.root.name, "started": self.started, "seq": self.graph_seq,
+                   "events": list(self.events)[::-1][:100], "since": self.since(), "hook_seen": self.hook_seen,
+                   "building": self.building, "error": self.error, "interval": self.interval}
+        # outside the lock: the review reads files, and the app runner has a lock of its own
+        out["review"] = self.review_state()
+        out["app"] = self.app.status() if self.app else None
+        return out
+
+    # ── review: accept or undo each changed file ──
+    def review_state(self) -> dict[str, Any]:
+        with self.lock:
+            files, events = self.files, list(self.events)
+        pending = self.review.pending(files)
+        who = _who_changed(events)
+        for p in pending:
+            p.update(who.get(p["path"], {"source": "disk", "tools": [], "at": None, "event": None}))
+        return {"pending": pending, "undone": self.review.undone_list()}
+
+    def review_action(self, action: str, paths: list[str], everything: bool = False) -> list[str]:
+        with self.lock:
+            files, events = self.files, list(self.events)
+        if everything:
+            paths = [p["path"] for p in self.review.pending(files)]
+        paths = [p for p in paths if isinstance(p, str)]
+        if action == "accept":
+            done = self.review.accept(paths, files)
+        elif action == "undo":
+            done = self.review.undo(paths, _who_changed(events))
+        elif action == "bring-back":
+            done = [p for p in paths[:1] if self.review.bring_back(p)]
+        else:
+            raise ValueError(action)
+        self.broadcast("review", self.review_state())
+        if action != "accept":
+            self.wake.set()  # pick up the restored files now
+        return done
+
+    def feedback_for_claude(self) -> str:
+        return message_for_claude(self.review.take_unreported())
 
     # ── the hook ──
     def notify(self, file: str, tool: str) -> None:
@@ -265,9 +336,11 @@ class LiveSession:
             for ev in list(self.events)[-5:]:
                 if ev["source"] == "claude" or now - ev["t"] > 8 or rel is None:
                     continue
-                if any(norm(self.root / f["path"]) == key for f in ev["files"]):
+                hits = [f["path"] for f in ev["files"] if norm(self.root / f["path"]) == key]
+                if hits:
                     ev["source"] = "claude"
                     ev["tools"] = sorted({*ev.get("tools", []), tool or "Edit"})
+                    ev.setdefault("claude", {})[hits[0]] = tool or "Edit"
                     updated = ev
             if updated:
                 self._since = None
@@ -318,24 +391,33 @@ class LiveSession:
             if f2 == files and g2 == git_state:
                 break
             files, git_state = f2, g2
-        t0 = time.perf_counter()
-        graph, hist = self.rebuild()
-        ms = int((time.perf_counter() - t0) * 1000)
-        self._unsaved = True
         with self.lock:
             changed = Scanner.changes(self.files, files)
-            d = diff_graphs(self.graph, graph)
+        # styles, JSON and other files outside the graph go to the review without a rebuild
+        needs_build = git_state != self.git_state or any(in_graph(f["path"]) for f in changed)
+        t0 = time.perf_counter()
+        if needs_build:
+            graph, hist = self.rebuild()
+            self._unsaved = True
+        else:
+            graph, hist = self.graph, self.history
+        ms = int((time.perf_counter() - t0) * 1000)
+        with self.lock:
+            d = diff_graphs(self.graph, graph) if needs_build else _no_diff()
             head_moved = bool(hist and self.history and hist.get("head") != self.history.get("head"))
-            event = self._event(changed, d, hist if head_moved else None, ms)
+            event = self._event(changed, d, hist if head_moved else None, ms if needs_build else 0)
             self.graph, self.history, self.files, self.git_state = graph, hist, files, git_state
-            self.graph_seq += 1
+            if needs_build:
+                self.graph_seq += 1
+                self._payload = None
             self.building = False
             self.error = None
-            self._payload = self._since = None
+            self._since = None
             if event:
                 self.events.append(event)
             msg = {"event": event, "since": self.since(), "seq": self.graph_seq}
         self.broadcast("change", msg)
+        self.broadcast("review", self.review_state())
         return event
 
     def _event(self, files: list[dict[str, str]], d: dict[str, Any], hist: dict[str, Any] | None,
@@ -345,18 +427,25 @@ class LiveSession:
             return None
         now = time.time()
         tools = []
+        by_claude: dict[str, str] = {}  # file -> the tool Claude Code changed it with
         for f in files:
             hit = self.notes.get(norm(self.root / f["path"]))
             if hit and now - hit[0] < ATTRIBUTION_WINDOW:
                 tools.append(hit[1])
+                by_claude[f["path"]] = hit[1]
         self.notes = {k: v for k, v in self.notes.items() if now - v[0] < ATTRIBUTION_WINDOW}
         self.seq += 1
         ev: dict[str, Any] = {
             "id": f"live-{self.seq}", "kind": "live", "seq": self.seq, "at": now_iso(), "t": now,
-            "source": "claude" if tools else "disk", "tools": sorted(set(tools)), "files": files[:200],
+            "source": "claude" if tools else "disk", "tools": sorted(set(tools)), "claude": by_claude, "files": files[:200],
             "title": _title(files), "diff": d,
             "summary": describe_counts(d) if _has_changes(d) else "no graph changes", "ms": ms,
         }
+        mine = {self.review.ours(f["path"]) for f in files}
+        if files and None not in mine:  # the review itself restored these files
+            ev["source"], ev["tools"] = "review", []
+            verb = "Brought back" if mine == {"bring back"} else "Undid changes to"
+            ev["title"] = f"{verb} {files[0]['path'].rsplit('/', 1)[-1]}" if len(files) == 1 else f"{verb} {len(files)} files"
         if commit and not files:  # HEAD moved and nothing on disk changed: a commit (or reset) was made
             ev.update(source="git", title=f"Committed {commit['short']} · {commit['title']}", sha=commit["sha"],
                       short=commit["short"], files=commit["files"], diff=commit["diff"] or d,
@@ -408,12 +497,18 @@ class LiveSession:
 
 class LiveServer:
     def __init__(self, session: LiveSession, page: Callable[[bytes], str], *, graph_id: str,
-                 port: int = DEFAULT_PORT, home: Path | None = None, idle_minutes: float = 0):
+                 port: int = DEFAULT_PORT, home: Path | None = None, idle_minutes: float = 0,
+                 app: Any = None, start_app: bool = False):
         self.session = session
         self.page = page
         self.graph_id = graph_id
         self.home = home
         self.idle_minutes = idle_minutes
+        self.app = app  # AppRunner: the repo's own frontend, for the UI tab
+        self.start_app = start_app
+        if app is not None:
+            app.on_change = lambda status: session.broadcast("app", status)
+            session.app = app
         self.token = secrets.token_urlsafe(18)
         handler = _make_handler(self)
         try:
@@ -429,6 +524,8 @@ class LiveServer:
     def start(self) -> None:
         """Serve in background threads (tests, embedding). `serve_forever` blocks instead."""
         self._write_lock()
+        if self.app is not None and self.start_app:
+            self.app.start()
         for target in (self.session.run, self._watch_idle, self.httpd.serve_forever):
             t = threading.Thread(target=target, daemon=True)
             t.start()
@@ -436,6 +533,8 @@ class LiveServer:
 
     def serve_forever(self) -> None:
         self._write_lock()
+        if self.app is not None and self.start_app:
+            self.app.start()
         for target in (self.session.run, self._watch_idle):
             t = threading.Thread(target=target, daemon=True)
             t.start()
@@ -451,6 +550,8 @@ class LiveServer:
         threading.Thread(target=self.httpd.shutdown, daemon=True).start()
 
     def close(self) -> None:
+        if self.app is not None:
+            self.app.stop()  # with everything the dev server started
         self.session.stop()
         self._remove_lock()
         try:
@@ -523,13 +624,15 @@ def _make_handler(server: LiveServer) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:  # noqa: N802
             if not self._host_ok():
                 return
-            path = self.path.split("?", 1)[0]
+            path, _, query = self.path.partition("?")
             if path in ("/", "/index.html"):
                 html = server.page(s.payload_bytes(server.graph_id))
+                # the UI tab frames the repo's own dev server, which runs on another localhost port
                 self._send(200, html.encode("utf8"), "text/html; charset=utf-8",
                            {"Content-Security-Policy": "default-src 'self'; script-src 'unsafe-inline'; "
                                                        "style-src 'unsafe-inline'; img-src 'self' data:; "
-                                                       "connect-src 'self'; frame-ancestors 'self'"})
+                                                       "connect-src 'self'; frame-ancestors 'self'; "
+                                                       "frame-src 'self' http://localhost:* http://127.0.0.1:*"})
             elif path == "/api/graph":
                 self._send(200, s.payload_bytes(server.graph_id), "application/json")
             elif path == "/api/state":
@@ -538,27 +641,56 @@ def _make_handler(server: LiveServer) -> type[BaseHTTPRequestHandler]:
                 self._json({"root": str(s.root), "started": s.started})
             elif path == "/api/events":
                 self._events()
+            elif path == "/api/review":
+                self._json(s.review_state())
+            elif path == "/api/review/diff":
+                rel = urllib.parse.parse_qs(query).get("path", [""])[0]
+                try:
+                    self._json(s.review.diff(rel))
+                except ValueError:
+                    self._send(400, b"Bad path", "text/plain")
+            elif path == "/api/app":
+                self._json(server.app.status() if server.app else {"state": "idle", "app": None, "log": []})
             else:
                 self._send(404, b"Not found", "text/plain")
 
         def do_POST(self) -> None:  # noqa: N802
             if not self._host_ok():
                 return
-            if not secrets.compare_digest(self.headers.get("X-Repo-Graph-Token", ""), server.token):
+            path = self.path.split("?", 1)[0]
+            # the hook and --stop use the lock file's token; the page uses the token it was served with
+            page_action = path.startswith(("/api/review/", "/api/app/"))
+            token, expected = ((self.headers.get("X-Repo-Graph-Page", ""), s.page_token) if page_action
+                               else (self.headers.get("X-Repo-Graph-Token", ""), server.token))
+            if not secrets.compare_digest(token, expected):
                 self._send(403, b"Forbidden", "text/plain")
                 return
             try:
-                n = min(int(self.headers.get("Content-Length") or 0), 64 * 1024)
+                n = min(int(self.headers.get("Content-Length") or 0), 256 * 1024)
                 body = json.loads(self.rfile.read(n) or b"{}")
             except Exception:
                 body = {}
-            path = self.path.split("?", 1)[0]
             if path == "/api/notify":
                 s.notify(str(body.get("file") or ""), str(body.get("tool") or ""))
                 self._send(204, b"", "text/plain")
+            elif path == "/api/feedback":
+                self._json({"message": s.feedback_for_claude()})
             elif path == "/api/stop":
                 self._send(204, b"", "text/plain")
                 server.shutdown()
+            elif path in ("/api/review/accept", "/api/review/undo", "/api/review/bring-back"):
+                try:
+                    done = s.review_action(path.rsplit("/", 1)[1], list(body.get("paths") or []), bool(body.get("all")))
+                except ValueError as e:
+                    self._json({"error": str(e)}, 400)
+                    return
+                self._json({"done": done})
+            elif path in ("/api/app/start", "/api/app/stop", "/api/app/install"):
+                if server.app is None:
+                    self._json({"error": "no app"}, 404)
+                    return
+                getattr(server.app, path.rsplit("/", 1)[1])()
+                self._json(server.app.status())
             else:
                 self._send(404, b"Not found", "text/plain")
 

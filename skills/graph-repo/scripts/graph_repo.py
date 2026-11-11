@@ -7,7 +7,7 @@ installed on first use into a private virtualenv (never into your global Python)
     python graph_repo.py build   <repo> [--ref REF] [--path SUBDIR] [--out DIR] [--history N]
     python graph_repo.py explore <DIR> <node> [--depth N] [--direction in|out|both] [--relations CALLS,IMPORTS]
     python graph_repo.py search  <DIR> <query> [--label LABEL] [--limit N]
-    python graph_repo.py live    <folder> [--open] [--port 7333] [--stop]
+    python graph_repo.py live    <folder> [--open] [--ui] [--ui-cmd CMD] [--port 7333] [--stop]
 
 <repo> is a GitHub URL (incl. /tree/<branch>/<dir> links), owner/repo, any git URL, or a local path.
 `build` writes DIR/graph.html (interactive, self-contained), DIR/graph.json and DIR/summary.txt and prints
@@ -254,12 +254,23 @@ def cmd_live(args) -> None:
     session = L.LiveSession(folder, local_rebuild(folder, max(args.history, 0), home, parse_cache),
                             interval=args.interval, max_nodes=args.max_nodes, save=parse_cache.save)
     parse_cache.save()  # the first build parsed everything: keep it for next time
+    from repo_graph_mcp.apprunner import AppRunner
+
+    app = AppRunner(folder, cmd=args.ui_cmd, cwd=args.ui_dir, url=args.ui_url)
     server = L.LiveServer(session, lambda payload: render_page(payload, f"{folder.name} · live graph"),
-                          graph_id=f"live:{folder.name}", port=args.port, home=home, idle_minutes=args.idle_minutes)
+                          graph_id=f"live:{folder.name}", port=args.port, home=home, idle_minutes=args.idle_minutes,
+                          app=app, start_app=args.ui)
     g = session.graph
     print(f"repo-graph: {len(g.nodes):,} nodes, {g.edge_count:,} links in {time.perf_counter() - t0:.1f} s")
     print(f"\nLive view: {server.url}")
     print(f"Watching {folder} for changes (every {session.interval:g} s). Open the Live tab to follow them.")
+    if app.info:
+        where = f" in {app.info['dir']}/" if app.info.get("dir") else ""
+        how = f"`{app.info['cmd']}`" if app.info.get("cmd") else "a static server"
+        when = "starting now" if args.ui else "start it from the UI tab"
+        print(f"Your app: {app.info['framework']}{where}, run with {how} ({when}).")
+    else:
+        print("No frontend found to preview: the UI tab still reviews changes. Use --ui-cmd to run one.")
     print(f"Stop it with Ctrl+C, or: python {Path(__file__).name} live \"{folder}\" --stop", flush=True)
     if args.open:
         import webbrowser
@@ -342,6 +353,10 @@ def main() -> None:
                     help="stop after this long with no browser tab open (default 120; 0 = never)")
     lv.add_argument("--max-nodes", type=int, default=6000)
     lv.add_argument("--stop", action="store_true", help="stop the live view of this folder")
+    lv.add_argument("--ui", action="store_true", help="start the repo's frontend for the UI tab right away")
+    lv.add_argument("--ui-cmd", help="command that runs the app, e.g. \"npm run dev\" or \"streamlit run app.py\"")
+    lv.add_argument("--ui-dir", help="folder (inside the repo) to run it in, or to look for the frontend in")
+    lv.add_argument("--ui-url", help="the app's local URL, when it isn't printed (e.g. http://localhost:3000)")
     s = sub.add_parser("search", help="find nodes by name/path")
     s.add_argument("dir")
     s.add_argument("query")

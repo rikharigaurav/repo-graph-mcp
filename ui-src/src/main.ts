@@ -7,8 +7,10 @@ import { drawGlyph } from "./icons";
 import { buildOverview, renderOverview, type OvItem, type Overview, type OverviewHandle } from "./overview";
 import { marksFor, renderChanges, type DiffMarks, type History, type HistoryEntry } from "./changes";
 import {
-  connectLive, fetchGraph, labelOf as liveLabel, renderLive, tickTimes, type LiveEvent, type LiveState, type LiveView,
+  connectLive, fetchGraph, labelOf as liveLabel, liveAction, liveGet, renderLive, setPageToken, tickTimes,
+  type LiveEvent, type LiveState, type LiveView,
 } from "./live";
+import { mountAppTab, renderAppTab, type AppStatus, type AppTabDom, type AppTabState, type Diff, type ReviewState } from "./apptab";
 import { GraphView } from "./view";
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -27,7 +29,7 @@ let view: GraphView | null = null;
 let vis: VisState | null = null;
 let lastInput: Record<string, any> = {};
 let focusLabel = "";
-type Mode = "overview" | "map" | "live";
+type Mode = "overview" | "map" | "live" | "ui";
 let mode: Mode = "map";
 let hasOverview = false;
 let ovHandle: OverviewHandle | null = null;
@@ -41,6 +43,12 @@ let liveStream: { close(): void } | null = null;
 let reloading = false;
 let reloadAgain = false;
 let flashNext: LiveEvent | null = null;
+// the UI tab: the repo's own app, and the review of changed files
+let appDom: AppTabDom | null = null;
+const appTab: AppTabState = {
+  app: null, review: { pending: [], undone: [] }, device: "desktop", showLog: false,
+  open: new Set(), diffs: new Map(), confirmAll: false, busy: new Set(),
+};
 
 // ── host integration ──────────────────────────────────────────────────────
 function applyHostContext(ctx: HostContext): void {
@@ -163,8 +171,9 @@ function load(payload: Payload): void {
   const working = history?.entries.find((e) => e.kind === "working" && e.diff);
   marks = working ? marksFor(model, working) : null;
   mode = hasOverview && !payload.focus ? "overview" : "map";
-  const live = (payload as any).live as { root: string; name: string; started: string; seq: number; interval: number } | undefined;
+  const live = (payload as any).live as { root: string; name: string; started: string; seq: number; interval: number; token?: string } | undefined;
   if (live && !liveStream) {
+    setPageToken(live.token ?? "");
     // served live: open on the Live tab, then follow the stream
     liveView = {
       state: {
@@ -338,6 +347,9 @@ function startLive(): void {
       const selId = liveView.selected?.entry.id ?? "live-since";
       liveView.state = s;
       liveView.conn = "open";
+      if (s.review) setReview(s.review);
+      if (s.app !== undefined) appTab.app = s.app;
+      drawAppTab();
       if (behind) void reloadGraph();
       else repickLive(selId);
     },
@@ -348,13 +360,25 @@ function startLive(): void {
         st.events = [ev, ...st.events.filter((e) => e.id !== ev.id)].slice(0, 200);
         liveView.fresh.add(ev.id);
         if (liveView.follow) flashNext = ev;
+        // a static site has no hot reload of its own
+        if (appTab.app?.app?.kind === "static" && appDom && !appDom.frame.hidden) appDom.frame.src = appDom.frame.src;
       }
       st.since = since;
-      st.seq = seq;
       st.building = false;
       st.error = null;
-      void reloadGraph();
+      if (seq !== st.seq) {
+        st.seq = seq;
+        void reloadGraph();
+      } else {
+        // only files outside the graph changed (styles, JSON…): nothing to refetch
+        const e = flashNext;
+        flashNext = null;
+        if (e && liveView.follow) repickLive(e.id);
+        else drawLive();
+      }
     },
+    review: (r) => { setReview(r); drawAppTab(); },
+    app: (a) => { appTab.app = a; drawAppTab(); },
     update: (ev, since) => {
       if (!liveView) return;
       const st = liveView.state;
@@ -476,6 +500,68 @@ function setFollow(on: boolean): void {
   else drawLive();
 }
 
+// ── the UI tab ────────────────────────────────────────────────────────────
+function toast(text: string): void {
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.setAttribute("role", "alert");
+  t.textContent = text;
+  $("#app").append(t);
+  setTimeout(() => t.remove(), 5000);
+}
+
+function setReview(r: ReviewState): void {
+  appTab.review = r;
+  // diffs change with the files: refetch the open ones, forget the rest
+  const pending = new Set(r.pending.map((p) => p.path));
+  appTab.diffs.clear();
+  for (const p of [...appTab.open]) {
+    if (pending.has(p)) loadDiff(p);
+    else appTab.open.delete(p);
+  }
+  updateUiTabBadge();
+}
+
+function updateUiTabBadge(): void {
+  const b = document.querySelector<HTMLButtonElement>('#modes button[data-mode="ui"]');
+  if (!b) return;
+  const n = appTab.review.pending.length;
+  let badge = b.querySelector<HTMLElement>(".tab-count");
+  if (!n) { badge?.remove(); b.removeAttribute("aria-label"); return; }
+  if (!badge) { badge = document.createElement("span"); badge.className = "tab-count"; b.append(badge); }
+  badge.textContent = String(n);
+  b.setAttribute("aria-label", `UI, ${n} change${n > 1 ? "s" : ""} to review`);
+}
+
+function loadDiff(path: string): void {
+  appTab.diffs.set(path, "loading");
+  liveGet<Diff>(`api/review/diff?path=${encodeURIComponent(path)}`)
+    .then((d) => { appTab.diffs.set(path, d); drawAppTab(); })
+    .catch(() => { appTab.diffs.set(path, "error"); drawAppTab(); });
+}
+
+function drawAppTab(): void {
+  if (mode !== "ui" || !liveView) return;
+  appDom ??= mountAppTab($("#appview"));
+  renderAppTab(appDom, appTab, {
+    appAction: (a) => {
+      liveAction<AppStatus>(`api/app/${a}`).then((s) => { appTab.app = s; drawAppTab(); })
+        .catch((e) => toast(`Couldn't ${a} the app: ${(e as Error).message}`));
+    },
+    review: (a, paths) => {
+      const key = paths === "all" ? ["*"] : paths;
+      key.forEach((k) => appTab.busy.add(k));
+      drawAppTab();
+      liveAction(`api/review/${a}`, paths === "all" ? { all: true } : { paths })
+        .catch((e) => toast(`Couldn't ${a.replace("-", " ")}: ${(e as Error).message}`))
+        .finally(() => { key.forEach((k) => appTab.busy.delete(k)); drawAppTab(); });
+    },
+    loadDiff: (p) => loadDiff(p),
+    redraw: () => drawAppTab(),
+    openLink: (url) => void openLink(url),
+  });
+}
+
 function drawLive(): void {
   if (mode !== "live" || !liveView || !model) return;
   renderLive($("#live"), liveView, model, {
@@ -500,7 +586,7 @@ function renderVcChip(): void {
   const working = h.entries.find((e) => e.kind === "working");
   if (working) chip.append(el("span", "vc-badge is-dirty", `● ${working.files.length} uncommitted`));
   if (h.upstream && h.ahead) chip.append(el("span", "vc-badge is-ahead", `↑${h.ahead} not pushed`));
-  if (!working && !(h.upstream && h.ahead)) chip.append(el("span", "vc-badge", `${h.entries.length} commits`));
+  if (!working && !(h.upstream && h.ahead)) chip.append(el("span", "vc-badge", `${h.entries.length} commit${h.entries.length === 1 ? "" : "s"}`));
   chip.setAttribute("aria-expanded", String(changesOpen));
   chip.title = "Uncommitted changes and recent commits";
 }
@@ -520,7 +606,7 @@ function drawChanges(): void {
 
 function openChanges(): void {
   if (!history) return;
-  if (mode === "live") setMode(hasOverview ? "overview" : "map"); // both panels sit on the left
+  if (mode === "live" || mode === "ui") setMode(hasOverview ? "overview" : "map"); // the timeline needs the graph
   changesOpen = true;
   const narrow = window.matchMedia("(max-width: 640px)").matches;
   if (narrow) closePanel();
@@ -566,17 +652,20 @@ function showChangesInMap(): void {
 // ── overview ⇄ map ────────────────────────────────────────────────────────
 function applyMode(): void {
   const isLive = mode === "live";
+  const isUi = mode === "ui";
   // the Live tab shows the overview (or the map, for a repo too small for one) with the changes beside it
   const showsOverview = mode === "overview" || (isLive && hasOverview);
   $("#overview").hidden = !showsOverview;
-  $("#app").dataset.mode = showsOverview ? "overview" : "map";
+  $("#appview").hidden = !isUi;
+  $("#app").dataset.mode = isUi ? "ui" : showsOverview ? "overview" : "map";
   $("#app").dataset.tab = mode;
   $("#modes").hidden = !hasOverview && !liveView;
   document.querySelectorAll<HTMLButtonElement>("#modes button").forEach((b) => {
     const m = b.dataset.mode as Mode;
-    b.hidden = (m === "overview" && !hasOverview) || (m === "live" && !liveView);
+    b.hidden = (m === "overview" && !hasOverview) || ((m === "live" || m === "ui") && !liveView);
     b.setAttribute("aria-selected", String(m === mode));
   });
+  if (isUi) drawAppTab();
   const narrow = window.matchMedia("(max-width: 640px)").matches;
   $("#live").hidden = !isLive;
   $("#app").classList.toggle("live-open", isLive && !narrow);
@@ -589,7 +678,7 @@ function applyMode(): void {
 function setMode(m: Mode): void {
   if (m === mode) return;
   if (m !== "map") select(null, false);
-  if (m === "live" && changesOpen) closeChanges();
+  if ((m === "live" || m === "ui") && changesOpen) closeChanges();
   mode = m;
   if (m === "live" && liveView && !marks) repickLive(liveView.selected?.entry.id ?? "live-since");
   applyMode();

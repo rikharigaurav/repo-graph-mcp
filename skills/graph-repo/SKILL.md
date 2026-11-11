@@ -7,9 +7,10 @@ description: >
   handled", "what does the agent do", "which code uses the LLM / vector DB", "what env vars does it need",
   or invokes /graph-repo. It builds a structural graph of the code, including its AI agents, MCP servers,
   external services and env vars, and shows it interactively. Also use it when the user wants to "watch
-  the graph live", "see the changes as Claude edits", or "show the live graph" of a local folder.
+  the graph live", "see the changes as Claude edits", "show the live graph" of a local folder, "run the
+  app / frontend here", or "review and accept or undo Claude's changes".
 metadata:
-  version: "0.6.1"
+  version: "0.7.0"
 ---
 
 # Graph a repository
@@ -121,6 +122,25 @@ plugin's hook; nothing else is needed. Running the same command again reuses a s
 watching that folder. Stop it with `PY "<skill dir>/scripts/graph_repo.py" live "<folder>" --stop`.
 
 It only watches folders on the machine where it runs: for a GitHub URL, clone it first or use `build`.
+
+### UI tab: the app itself, and accepting or undoing changes
+
+When the user wants to see the app (not the graph) change as you edit it, or to accept or reject your
+changes, start the live view with `--ui` and point them to its **UI** tab:
+
+```
+PY "<skill dir>/scripts/graph_repo.py" live "<folder>" --open --ui
+```
+
+It finds the frontend (a package.json `dev` script for Vite, Next.js, React, Vue, Svelte, Astro, Angular…,
+or a folder with `index.html`), installs its dependencies if needed, runs it, and shows it beside a
+review: each changed file with its diff and **Accept** / **Undo**. The printed line "Your app: …" says
+what it found; if it found nothing, ask how they run the app and pass `--ui-cmd "<command>"` (plus
+`--ui-dir <folder>` or `--ui-url <url>` when needed).
+
+Before each user message, this plugin's hook tells you which of your changes the user undid there.
+When it does, the files are back as they were: re-read them before editing again and don't redo those
+changes unless the user asks.
 
 ## Reading the graph
 

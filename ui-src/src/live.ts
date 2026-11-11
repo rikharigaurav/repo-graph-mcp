@@ -23,6 +23,8 @@ export interface LiveState {
   building: boolean;
   error: string | null;
   interval: number;
+  review?: import("./apptab").ReviewState;
+  app?: import("./apptab").AppStatus | null;
 }
 export type Conn = "connecting" | "open" | "lost";
 
@@ -33,6 +35,8 @@ export interface LiveHandlers {
   status(building: boolean, error: string | null): void;
   hook(seen: string): void;
   connection(c: Conn): void;
+  review(r: import("./apptab").ReviewState): void;
+  app(a: import("./apptab").AppStatus): void;
 }
 
 /** The stream from the live server. EventSource reconnects by itself; each reconnect starts with a hello. */
@@ -53,7 +57,29 @@ export function connectLive(h: LiveHandlers): { close(): void } {
   on("event", (d) => h.update(d.event, d.since));
   on("status", (d) => h.status(!!d.building, d.error ?? null));
   on("hook", (d) => h.hook(d.hook_seen));
+  on("review", (d) => h.review(d));
+  on("app", (d) => h.app(d));
   return { close: () => es.close() };
+}
+
+let pageToken = "";
+export function setPageToken(t: string): void { pageToken = t; }
+
+/** The page's own actions on the live server (accept, undo, start the app). */
+export async function liveAction<T = unknown>(path: string, body: unknown = {}): Promise<T> {
+  const r = await fetch(path, {
+    method: "POST", cache: "no-store",
+    headers: { "Content-Type": "application/json", "X-Repo-Graph-Page": pageToken },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`the live server answered ${r.status}`);
+  return (await r.json()) as T;
+}
+
+export async function liveGet<T = unknown>(path: string): Promise<T> {
+  const r = await fetch(path, { cache: "no-store" });
+  if (!r.ok) throw new Error(`the live server answered ${r.status}`);
+  return (await r.json()) as T;
 }
 
 export async function fetchGraph(): Promise<Payload> {
