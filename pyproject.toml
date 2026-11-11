@@ -1,6 +1,6 @@
 [project]
 name = "repo-graph-mcp"
-version = "0.6.0"
+version = "0.6.1"
 description = "Claude plugin / MCP server: parse a repository into a code-structure graph and show it interactively in the chat."
 readme = "README.md"
 license = "MIT"

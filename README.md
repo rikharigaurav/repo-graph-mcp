@@ -6,9 +6,8 @@ interactive map you can pan, search, filter and click through. A **GenAI & servi
 the code: the AI agents in it (and their steps and tools), MCP servers, the LLMs, vector/graph databases
 and other services it calls, and the env vars it reads, each linked to the functions behind it.
 
-It's the graph half of [Read-Code-Structure](https://github.com/rikharigaurav/Read-Code-Structure),
-packaged as a Claude plugin. It makes no LLM summaries and no embeddings, so a typical repo is graphed in
-a second or two instead of minutes, and it needs no API keys.
+It's a Claude plugin and MCP server. It makes no LLM summaries and no embeddings, so a typical repo is
+graphed in a second or two instead of minutes, and it needs no API keys.
 
 It runs two ways:
 - **Agent mode** (the default; works as soon as the plugin is installed). Claude runs the bundled graph
@@ -23,7 +22,7 @@ It opens on an **overview**: the repo as four calm columns (Frontend → API →
 bundled arrows between them. Hover a row to see what it talks to; click it to open just that part as an
 interactive graph. The full map is one click away.
 
-![The graph of Read-Code-Structure rendered inside the chat](docs/graph-view.png)
+![The map view: repo-graph-mcp's own code, folders and files with the calls between them](docs/graph-view.png)
 
 <table><tr>
 <td><img src="docs/graph-view-details.png" alt="Selecting an endpoint shows who requests it and what it calls"></td>
@@ -31,6 +30,9 @@ interactive graph. The full map is one click away.
 </tr></table>
 
 ## What it does
+
+It started as the graph part of the [Read-Code-Structure](https://github.com/rikharigaurav/Read-Code-Structure)
+backend, without the slow LLM and vector steps:
 
 | | Read-Code-Structure backend | repo-graph-mcp |
 |---|---|---|
@@ -202,21 +204,21 @@ use the builder installs tree-sitter into a private environment in your cache fo
 
 Start a new chat or session after installing, then ask:
 
-- "Graph https://github.com/rikharigaurav/Read-Code-Structure", or `/graph-repo <repo>`
-- "Graph the `feat/mcp-server` branch, just the `frontend` folder"
-- "What calls `create_relation`, two levels up?"
-- "Which frontend code hits `POST /chat/`?" and "Which endpoints have no tests?"
+- "Graph https://github.com/rikharigaurav/repo-graph-mcp", or `/graph-repo <repo>`
+- "Graph the `version-control` branch, just the `ui-src` folder"
+- "What calls `build_graph`, two levels up?"
+- "Which endpoints have no tests?" and "Where is `GITHUB_TOKEN` read?"
 
-In the Claude app the graph appears as an artifact. In Claude Code it opens in your browser, and the
-files stay in the cache folder. Follow-up questions are answered from the saved graph, so they're
+In the Claude app the graph appears as an artifact (or inside the chat, with MCP mode). In Claude Code
+on your computer it opens in your browser, and the files stay in the cache folder. Follow-up questions are answered from the saved graph, so they're
 instant. Private repos work whenever your own `git clone` works.
 
 You can also run the builder yourself:
 
 ```bash
 python skills/graph-repo/scripts/graph_repo.py build https://github.com/owner/repo --out ./graph
-python skills/graph-repo/scripts/graph_repo.py explore ./graph "POST /chat/" --direction in --depth 2
-python skills/graph-repo/scripts/graph_repo.py search  ./graph neodb
+python skills/graph-repo/scripts/graph_repo.py explore ./graph build_graph --direction in --depth 2
+python skills/graph-repo/scripts/graph_repo.py search  ./graph history
 ```
 
 ## Optional: MCP mode (graph inside the chat)

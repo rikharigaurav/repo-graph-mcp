@@ -9,7 +9,7 @@ description: >
   external services and env vars, and shows it interactively. Also use it when the user wants to "watch
   the graph live", "see the changes as Claude edits", or "show the live graph" of a local folder.
 metadata:
-  version: "0.6.0"
+  version: "0.6.1"
 ---
 
 # Graph a repository
@@ -27,6 +27,14 @@ There are two ways to run it. Pick the first that is available.
 Use them: `graph_repo` renders the graph inside the chat and returns a summary plus a `graph_id`;
 `explore_graph` shows a focused view around one node; `search_graph` finds node ids. Pass the repository
 exactly as the user gave it, `ref` for a branch/tag, `path` for one sub-folder.
+
+The in-chat view only appears where the app can display MCP App views. When these tools reach you from a
+cloud session through the user's linked computer (their names start with `mcp__remote-devices__`), or
+the user says they can't see the graph, also run agent mode (B) and publish the artifact, so they always
+get a view they can open.
+
+Graph exactly the repository the user named. Never fall back to another repository (one from an
+example, an earlier chat or a connected folder); if they didn't name one, ask which.
 
 ## B. Agent mode (default, no server needed)
 
@@ -54,9 +62,14 @@ the user's cache folder (never into their global Python); later runs start immed
 3. **Show the graph.** Don't redraw it as Mermaid, ASCII or a table, and don't rewrite the HTML:
    - If you can publish artifacts (an Artifact tool is available), publish `graph-artifact.html`
      unchanged, with a one-sentence description such as "Code-structure graph of owner/repo". It
-     already has its title, light and dark themes, and phone layout.
-   - Otherwise open `graph.html` in the user's browser: `start "" "<path>"` on Windows,
-     `open "<path>"` on macOS, `xdg-open "<path>"` on Linux. Tell the user the file path too.
+     already has its title, light and dark themes, and phone layout. When you graph the same repo again,
+     publish the same file path so the artifact's link stays the same instead of making a new one.
+   - Otherwise, if you are running on the user's own computer, open `graph.html` in their browser:
+     `start "" "<path>"` on Windows, `open "<path>"` on macOS, `xdg-open "<path>"` on Linux. Tell the
+     user the file path too.
+   - In a cloud container with no Artifact tool, a browser you open is invisible to the user: don't
+     claim the graph is open. Hand the path of `graph-artifact.html` back (to the user, or to the
+     conversation that called you) so it can be published.
 
 4. **Orient the user.** Reply briefly, drawing on the printed summary: the main areas (top-level folders),
    the API endpoints and who calls them, the AI agents and their flow, the services it depends on, the
