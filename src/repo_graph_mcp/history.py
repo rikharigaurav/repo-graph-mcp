@@ -200,7 +200,8 @@ def _rec(n: G.Node, **extra: Any) -> dict[str, Any]:
     return r
 
 
-def diff_graphs(old: CodeGraph, new: CodeGraph) -> dict[str, Any]:
+def diff_graphs(old: CodeGraph, new: CodeGraph, limit: int | None = MAX_LISTED) -> dict[str, Any]:
+    """Nodes added, changed and removed between two graphs; each list is cut at `limit` (None = all)."""
     added, changed, removed = [], [], []
     for nid, n in new.nodes.items():
         if n.label not in TRACKED:
@@ -231,11 +232,18 @@ def diff_graphs(old: CodeGraph, new: CodeGraph) -> dict[str, Any]:
     for lst in (added, changed, removed):
         lst.sort(key=lambda r: (order.get(r["l"], 99), r["p"], r.get("line", 0)))
     return {
-        "added": added[:MAX_LISTED], "changed": changed[:MAX_LISTED], "removed": removed[:MAX_LISTED],
+        "added": added[:limit], "changed": changed[:limit], "removed": removed[:limit],
         "counts": counts,
         "links": {"added": len(b - a), "removed": len(a - b)},
-        "truncated": max(len(added), len(changed), len(removed)) > MAX_LISTED,
+        "truncated": limit is not None and max(len(added), len(changed), len(removed)) > limit,
     }
+
+
+def cut(d: dict[str, Any], limit: int = MAX_LISTED) -> dict[str, Any]:
+    """`d` with each list cut at `limit`, as the view takes it."""
+    longest = max(len(d["added"]), len(d["changed"]), len(d["removed"]))
+    return {**d, "added": d["added"][:limit], "changed": d["changed"][:limit], "removed": d["removed"][:limit],
+            "truncated": d.get("truncated", False) or longest > limit}
 
 
 def describe_counts(d: dict[str, Any]) -> str:

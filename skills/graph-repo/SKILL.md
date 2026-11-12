@@ -8,9 +8,12 @@ description: >
   or invokes /graph-repo. It builds a structural graph of the code, including its AI agents, MCP servers,
   external services and env vars, and shows it interactively. Also use it when the user wants to "watch
   the graph live", "see the changes as Claude edits", "show the live graph" of a local folder, "run the
-  app / frontend here", or "review and accept or undo Claude's changes".
+  app / frontend here", or "review and accept or undo Claude's changes". And use it to review changes:
+  "review this PR", "review PR #12", "what did this branch change", "what could this break", "check the
+  code Claude / Cursor / a vibe-coding session wrote", "which tests should I run", "what changed since
+  <commit>".
 metadata:
-  version: "0.7.0"
+  version: "0.8.0"
 ---
 
 # Graph a repository
@@ -27,7 +30,9 @@ There are two ways to run it. Pick the first that is available.
 
 Use them: `graph_repo` renders the graph inside the chat and returns a summary plus a `graph_id`;
 `explore_graph` shows a focused view around one node; `search_graph` finds node ids. Pass the repository
-exactly as the user gave it, `ref` for a branch/tag, `path` for one sub-folder.
+exactly as the user gave it, `ref` for a branch/tag, `path` for one sub-folder. To review a PR or a set of
+changes, use `review_changes` when it is listed (see "Review changes" below; it takes `pr`, `base`,
+`head`), else agent mode's `diff`.
 
 The in-chat view only appears where the app can display MCP App views. When these tools reach you from a
 cloud session through the user's linked computer (their names start with `mcp__remote-devices__`), or
@@ -103,6 +108,40 @@ chip opens the same timeline. Use it when the user asks what changed, what a com
 pushed, or to review work in progress, including edits you just made: run `build` again after editing.
 It's fast (snapshots per commit SHA and parses per file content are cached), so rebuild freely and
 republish the page to show the latest state.
+
+## Review changes: a PR, a branch, or work in progress
+
+To review what a change did (a pull request, a branch, a range of commits, or uncommitted work, such as
+code you or another agent just wrote), compare the two versions' graphs:
+
+```
+PY "<skill dir>/scripts/graph_repo.py" diff <repo> --pr 12                     # a GitHub pull request
+PY "<skill dir>/scripts/graph_repo.py" diff <repo> --to feature [--from main]  # a branch
+PY "<skill dir>/scripts/graph_repo.py" diff <repo> --from <sha> --to <sha>     # any two commits
+PY "<skill dir>/scripts/graph_repo.py" diff "<local folder>" [--from HEAD]     # uncommitted work
+```
+
+Defaults: a local folder compares `--from HEAD` with what is on disk (`--to working`); a branch or PR
+is compared with where it branched off its base. Pass `--out` into your working directory when you will
+publish the view. It prints a Markdown review (also saved as `diff.md`, with `diff.json`) and writes a
+`graph.html` / `graph-artifact.html` of the new side that opens with the changes marked and listed.
+
+How to use the review:
+- **Lead with "Check first".** Those are the findings most likely to be real breakage or real risk:
+  callers in files the change didn't touch that still call a removed or moved function, or a function
+  whose signature changed; secrets an env var name would expose to the browser; new packages (check
+  each exists and is the one meant: a misspelt or invented package name is a classic vibe-coding
+  mistake); new services and env vars that need configuring; code no test reaches.
+- **Then read the diff where it points.** The review is static (calls matched by name, no runtime), so
+  confirm each finding in the code before calling it a bug, and say which ones you confirmed.
+- **"Tests to run"** lists the test files that call the changed code directly or within two calls.
+  Run them when you can.
+- Publish `graph-artifact.html` like step 3 above when the user wants to see it, and `explore` the
+  output folder to look around any finding.
+- `--fail-on-findings` exits with status 2 when "Check first" isn't empty, for CI.
+
+To post a review on a GitHub PR, draft it from the findings and show it to the user first; post only
+when they say so.
 
 ## Live view
 

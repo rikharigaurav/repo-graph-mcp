@@ -13,7 +13,7 @@ export interface Diff {
 }
 export interface HistoryEntry {
   id: string;
-  kind: "working" | "commit" | "live";
+  kind: "working" | "commit" | "live" | "range";
   title: string;
   /** What the overview banner calls it ("Changes from …"). */
   label?: string;
@@ -23,6 +23,8 @@ export interface HistoryEntry {
   date?: string;
   pushed?: boolean;
   url?: string;
+  /** A range (a PR, a branch, commits): how many commits it spans. */
+  commits?: number;
   files: { path: string; status: "added" | "modified" | "deleted" }[];
   diff: Diff | null;
   summary: string;
@@ -36,6 +38,8 @@ export interface History {
   behind: number;
   dirty: boolean;
   head_url?: string;
+  /** Set when the view compares two versions (`graph_repo.py diff`, the review_changes tool). */
+  range?: { base: string | null; head: string | null; label: string; base_label: string; head_label: string; commits: number };
   entries: HistoryEntry[];
 }
 
@@ -123,15 +127,16 @@ export function renderChanges(host: HTMLElement, h: History, model: Model, selec
   close.onclick = () => cb.close();
   head.append(close);
   const body = el("div", "panel-body");
-  body.append(el("p", "panel-kind", "Version control"));
-  const title = el("h2", "panel-title is-code", `${h.branch} @ ${h.short}`);
+  body.append(el("p", "panel-kind", h.range ? "Comparing two versions" : "Version control"));
+  const title = el("h2", "panel-title is-code", h.range ? h.range.label : `${h.branch} @ ${h.short}`);
   body.append(title);
   const status: string[] = [];
-  if (h.upstream) {
+  if (h.range) status.push(`${h.range.base_label} → ${h.range.head_label}`);
+  else if (h.upstream) {
     status.push(h.ahead ? `${h.ahead} commit${h.ahead > 1 ? "s" : ""} not pushed to ${h.upstream}` : `in sync with ${h.upstream}`);
     if (h.behind) status.push(`${h.behind} behind`);
   } else status.push("no upstream branch");
-  if (h.dirty) status.push("uncommitted changes");
+  if (h.dirty) status.push(h.range ? "includes uncommitted work" : "uncommitted changes");
   body.append(el("p", "panel-facts", status.join(" · ")));
 
   const list = el("ol", "vc-list");
@@ -147,6 +152,7 @@ export function renderChanges(host: HTMLElement, h: History, model: Model, selec
     top.append(counts(tally(e.diff)));
     const sub = el("span", "vc-sub");
     const bits: string[] = [];
+    if (e.kind === "range" && e.commits) bits.push(`${e.commits} commit${e.commits === 1 ? "" : "s"}`);
     if (e.kind === "commit") {
       if (e.author) bits.push(e.author);
       if (e.date) bits.push(ago(e.date));

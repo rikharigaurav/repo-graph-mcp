@@ -9,6 +9,10 @@ and other services it calls, and the env vars it reads, each linked to the funct
 It's a Claude plugin and MCP server. It makes no LLM summaries and no embeddings, so a typical repo is
 graphed in a second or two instead of minutes, and it needs no API keys.
 
+It also **reviews changes** by what they did to that structure: a pull request, a branch, a range of
+commits, or uncommitted work (yours, Claude's or another agent's). It points at the callers a change left
+behind, the code no test reaches, the tests to run and the new packages, services and env vars.
+
 It runs two ways:
 - **Agent mode** (the default; works as soon as the plugin is installed). Claude runs the bundled graph
   builder with its own tools, then shows the graph as an artifact in the Claude app, or opens it in your
@@ -193,6 +197,38 @@ Running the app means running the repo's own `dev` script, with the same trust a
 The page's buttons work only from the page the server served (a per-session token), and only on files
 inside the watched folder.
 
+### Review changes: a PR, a branch, or what was just written
+
+```
+python skills/graph-repo/scripts/graph_repo.py diff owner/repo --pr 12
+python skills/graph-repo/scripts/graph_repo.py diff . --to feature            # vs where it branched from main
+python skills/graph-repo/scripts/graph_repo.py diff . --from v1.2.0 --to v1.3.0
+python skills/graph-repo/scripts/graph_repo.py diff .                         # uncommitted work vs HEAD
+```
+
+Or ask Claude: "review PR #12 of owner/repo", "what did this branch break?", "check what you just
+wrote". Both sides are graphed (cached by commit, so a second review is instant) and compared:
+
+- **Check first.** The findings most likely to be real: a function that was removed, moved or given a
+  new signature while files the change didn't touch still call it the old way; an env var whose name
+  would ship a secret to the browser; new packages (worth checking each exists and is the one meant, the
+  classic AI-coding slip); new external services and env vars to configure; new or changed code that no
+  test reaches.
+- **Added, changed, moved, removed** functions, classes and endpoints. A function whose lines moved
+  to another file is reported as moved, not as one removal and one addition.
+- **May behave differently:** unchanged code that calls something the change rewrote.
+- **Tests to run:** the test files that call the changed code, directly or within two calls.
+- **Endpoints, services and config**, **packages** (package.json, requirements*.txt, pyproject.toml),
+  **commits** and **files**.
+
+It writes `diff.md` (the review), `diff.json`, and a `graph.html` of the new side that opens with the
+changes marked on the overview and the map and listed beside them. `--fail-on-findings` exits with
+status 2 when there's anything under "Check first", for CI. A PR is fetched as `pull/<n>/head` into a
+temporary partial clone (history only, file contents on demand); your own checkout is never modified.
+
+It's static: calls are matched by name, so dynamic dispatch and reflection aren't followed. Treat it
+as where to look, then read those parts of the diff.
+
 ## MCP tools (MCP mode)
 
 | Tool | Shown to | What it does |
@@ -200,6 +236,7 @@ inside the watched folder.
 | `graph_repo` | model + view | Fetch and parse a repo, render the interactive graph, return a summary and a `graph_id` |
 | `explore_graph` | model + view | Focused view around one node: callers, callees, imports, tests (`direction`, `depth`, `relations`) |
 | `search_graph` | model | Find nodes by name/path/docstring |
+| `review_changes` | model + view | Review a PR (`pr`), a branch or commits (`base`, `head`) or a local folder's uncommitted work: the Markdown review, and the graph with the changes marked |
 | `graph_view_data` | view only | Lets the view load the whole graph from an explore result |
 | `push_graph_to_neo4j` | model | Only when `NEO4J_URI` is set: write the graph into Neo4j (ids namespaced per repo) |
 
@@ -246,6 +283,7 @@ Start a new chat or session after installing, then ask:
 - "Graph the `version-control` branch, just the `ui-src` folder"
 - "What calls `build_graph`, two levels up?"
 - "Which endpoints have no tests?" and "Where is `GITHUB_TOKEN` read?"
+- "Review PR #3 of owner/repo" and "What did my uncommitted changes break?"
 
 In the Claude app the graph appears as an artifact (or inside the chat, with MCP mode). In Claude Code
 on your computer it opens in your browser, and the files stay in the cache folder. Follow-up questions are answered from the saved graph, so they're

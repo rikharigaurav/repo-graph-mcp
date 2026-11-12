@@ -1,3 +1,3 @@
 """Parse a repository into a code-structure graph and show it in the chat (MCP App)."""
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"

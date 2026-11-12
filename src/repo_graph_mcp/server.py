@@ -69,6 +69,11 @@ Tools for turning a code repository into a structural graph and showing it in th
 - For a local folder or a git clone, the summary's `Version control:` block lists the uncommitted
   changes and the last commits as graph changes (added/changed/removed functions, endpoints, services),
   and which commits aren't pushed; the view shows them on a timeline.
+- To review a pull request, a branch, a range of commits or a folder's uncommitted work ("review PR #12",
+  "what did this branch break", "check what Claude changed"), call `review_changes`: it graphs both sides
+  and reports what to check first (callers left calling removed code or an old signature, new packages,
+  services and env vars, untested code), the tests to run, and shows the graph with the changes marked.
+  Use its findings to decide which parts of the diff to read closely; it's static, not a full review.
 - Graphs are cached per commit, so calling again for the same repo is instant.
 Only Python and JavaScript/TypeScript are parsed into functions/classes/calls; other languages appear as
 files. Links are resolved statically, so dynamic dispatch and reflection are not followed.
@@ -306,6 +311,66 @@ async def explore_graph(
     payload = _payload(key, sub, focus=center.id, mode="explore")
     payload["stats"] = g.stats
     return CallToolResult(content=[TextContent(type="text", text=text)], structured_content=payload)
+
+
+@apps.tool(resource_uri=VIEW_URI, name="review_changes", title="Review a PR or a set of changes", annotations=READ_ONLY)
+async def review_changes(
+    ctx: Context,
+    repo: Annotated[str, Field(description="GitHub URL, 'owner/repo', any git URL, or an absolute path to a local "
+                                           "checkout on the MCP server's machine.")],
+    pr: Annotated[int | None, Field(description="Pull request number: review it against where it branched from its base.")] = None,
+    base: Annotated[str | None, Field(description="The old side: branch, tag or commit. Default: HEAD when reviewing a "
+                                                  "local folder's uncommitted work, else where `head` branched from the default branch.")] = None,
+    head: Annotated[str | None, Field(description="The new side: branch, tag, commit, or 'working' (a local folder as it "
+                                                  "is on disk, uncommitted work included). Default: 'working' for a local "
+                                                  "folder, else the default branch.")] = None,
+    path: Annotated[str | None, Field(description="Only compare this sub-folder.")] = None,
+) -> CallToolResult:
+    """Review what a pull request, a branch, a range of commits or uncommitted work did to the code's
+    structure, and show the head's graph with those changes marked. Returns a Markdown review: what to
+    check first (callers in untouched files still calling removed code or an old signature, new packages,
+    services and env vars, code no test reaches), what was added/changed/moved/removed, code that may
+    behave differently, the tests to run, endpoint/service/config changes and package changes. Static
+    analysis: use it to know where to look, then read the diff of those places. Needs git."""
+    from . import compare as C
+
+    spec = F.parse_repo_spec(repo, None, path)
+    cache_base = os.getenv("REPO_GRAPH_CACHE_DIR")
+    pc_key = spec.display if spec.kind != "local" else str(spec.local_path)
+    pc = _PARSE_CACHES.get(pc_key)
+    if pc is None:
+        pc_path = Path(cache_base) / "parses" / (re.sub(r"[^A-Za-z0-9_.@-]+", "_", pc_key)[:120] + ".json.gz") if cache_base else None
+        pc = _PARSE_CACHES[pc_key] = ParseCache(pc_path)
+    info = {"display": spec.display, "name": spec.name or spec.display, "owner": spec.owner, "ref": head or "",
+            "source": spec.kind, "built_at": int(time.time())}
+    if spec.kind in ("github", "git"):
+        info["url"] = spec.url
+
+    def build(folder, inf):
+        inf = dict(inf)
+        if spec.kind == "github" and inf.get("sha") and not inf.get("dirty"):
+            sub = inf.get("subpath") or ""
+            inf["blob_base"] = f"{spec.url}/blob/{inf['sha']}/" + (f"{sub}/" if sub else "")
+        return build_graph(folder, inf, parse_cache=pc)
+
+    progress = Progress(ctx)
+    await progress(0.05, f"Comparing two versions of {spec.display}")
+    try:
+        async with BUILD_SLOTS:
+            g, rep, hist = await anyio.to_thread.run_sync(lambda: C.run(
+                spec, base, head, pr, info=info, build=build, snapshots=H.Snapshots(store),
+                key_for=lambda sha: _key(spec, sha)))
+    except F.FetchError as e:
+        return _error(str(e))
+    finally:
+        pc.save()
+    key = f"diff:{_key(spec, rep['head_sha'])}:{rep['short']}"
+    store.put(key, g, persist=False)
+    HISTORIES[key] = hist
+    text = C.to_markdown(rep, spec.display.split("/")[-1]) + (
+        f"\ngraph_id for explore_graph / search_graph on the new side: {key}"
+        + ("\nThe user sees the graph with these changes marked; don't redraw it." if client_supports_apps(ctx) else ""))
+    return CallToolResult(content=[TextContent(type="text", text=text)], structured_content=_payload(key, g))
 
 
 @apps.tool(resource_uri=VIEW_URI, name="graph_view_data", title="Graph view data", visibility=["app"],

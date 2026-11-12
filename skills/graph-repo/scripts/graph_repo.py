@@ -8,6 +8,7 @@ installed on first use into a private virtualenv (never into your global Python)
     python graph_repo.py explore <DIR> <node> [--depth N] [--direction in|out|both] [--relations CALLS,IMPORTS]
     python graph_repo.py search  <DIR> <query> [--label LABEL] [--limit N]
     python graph_repo.py live    <folder> [--open] [--ui] [--ui-cmd CMD] [--port 7333] [--stop]
+    python graph_repo.py diff    <repo> [--from REF] [--to REF|working] [--pr N] [--out DIR] [--fail-on-findings]
 
 <repo> is a GitHub URL (incl. /tree/<branch>/<dir> links), owner/repo, any git URL, or a local path.
 `build` writes DIR/graph.html (interactive, self-contained), DIR/graph.json and DIR/summary.txt and prints
@@ -15,6 +16,9 @@ the summary. In a git checkout it also shows uncommitted changes and the last N 
 each commit's graph is cached by its SHA, so rebuilding after an edit only re-parses the files that changed. `explore` writes DIR/explore-<node>.html focused on one node and prints its relationships.
 `live` serves the view on http://127.0.0.1:7333/ and keeps it current while files change; its Live tab
 lists each change as it happens (labelled with the Claude Code tool that made it, through the plugin's hook).
+`diff` reviews a range (a pull request, a branch, commits, or uncommitted work) by what it did to the structure:
+callers not updated for a changed signature or a removed function, code no test reaches, the tests to run, new
+services, env vars, endpoints and packages. It writes DIR/diff.md and a graph.html that opens with the changes marked.
 """
 
 from __future__ import annotations
@@ -198,6 +202,64 @@ def cmd_build(args) -> None:
     print(f"Follow-ups:        python {Path(__file__).name} explore \"{out}\" <node>   |   search \"{out}\" <query>")
 
 
+def cmd_diff(args) -> None:
+    from repo_graph_mcp import compare as C
+    from repo_graph_mcp import fetch as F
+    from repo_graph_mcp import history as H
+    from repo_graph_mcp.builder import build_graph
+    from repo_graph_mcp.parsecache import ParseCache
+    from repo_graph_mcp.store import GraphStore
+
+    repo = str(Path(args.repo).expanduser().resolve()) if Path(args.repo).expanduser().is_dir() else args.repo
+    spec = F.parse_repo_spec(repo, None, args.path)
+    home = cache_dir()
+    snapshots = H.Snapshots(GraphStore(max_items=4, disk_dir=str(home / "snapshots")))
+    local_name = Path(spec.local_path).resolve().name if spec.kind == "local" else ""
+
+    def key_for(sha: str) -> str:  # the same keys as `build`, so the two share snapshots
+        base = spec.display if spec.kind != "local" else f"local:{local_name}"
+        sub = spec.subpath.strip("/")
+        return f"{base}@{sha[:12]}" + (f":{sub}" if sub else "")
+
+    parse_cache = ParseCache(home / "parses" / f"{slug(spec.display if spec.kind != 'local' else str(Path(spec.local_path).resolve()))}.json.gz")
+    info = {"display": spec.display, "name": spec.name or spec.display, "owner": spec.owner,
+            "ref": args.head or "", "source": spec.kind, "built_at": int(time.time())}
+    if spec.kind == "github":
+        info["url"] = spec.url
+
+    def build(folder: Path, inf: dict):
+        inf = dict(inf)
+        if spec.kind == "github" and inf.get("sha") and not inf.get("dirty"):
+            sub = inf.get("subpath") or ""
+            inf["blob_base"] = f"{spec.url}/blob/{inf['sha']}/" + (f"{sub}/" if sub else "")
+        return build_graph(folder, inf, parse_cache=parse_cache)
+
+    try:
+        g, rep, hist = C.run(spec, args.base, args.head, args.pr, info=info, build=build, snapshots=snapshots,
+                             key_for=key_for, say=lambda m: print(f"repo-graph: {m}", file=sys.stderr))
+    except C.RangeError as e:
+        sys.exit(f"repo-graph: {e}")
+    parse_cache.save()
+    name = spec.display.split("/")[-1] if spec.kind != "local" else local_name
+    md = C.to_markdown(rep, name)
+    out = Path(args.out) if args.out else home / "diffs" / slug(f"{key_for(rep['head_sha'])}-{rep['short']}")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "diff.md").write_text(md, "utf8")
+    (out / "diff.json").write_text(json.dumps({k: v for k, v in rep.items() if k not in ("diff", "graphed")},
+                                              separators=(",", ":")), "utf8")
+    (out / "graph.json").write_text(json.dumps(g.to_json(), separators=(",", ":")), "utf8")
+    (out / "history.json").write_text(json.dumps(hist, separators=(",", ":")), "utf8")
+    payload = g.to_ui_payload(max_nodes=args.max_nodes)
+    payload.update(graphId=f"diff:{key_for(rep['head_sha'])}:{rep['short']}", mode="repo", history=hist)
+    write_view(payload, f"{name} · {rep['short']}", out / "graph.html")
+    print(md)
+    print(f"Review:            {out / 'diff.md'}")
+    print(f"Interactive graph: {out / 'graph.html'}  (opens with these changes marked)")
+    print(f"Follow-ups:        python {Path(__file__).name} explore \"{out}\" <node>   |   search \"{out}\" <query>")
+    if args.fail_on_findings and rep["check_first"]:
+        sys.exit(2)
+
+
 def local_rebuild(folder: Path, commits: int, home: Path, parse_cache):
     """A function that graphs `folder` as it is on disk now, with its version-control history."""
     from repo_graph_mcp import fetch as F
@@ -357,6 +419,20 @@ def main() -> None:
     lv.add_argument("--ui-cmd", help="command that runs the app, e.g. \"npm run dev\" or \"streamlit run app.py\"")
     lv.add_argument("--ui-dir", help="folder (inside the repo) to run it in, or to look for the frontend in")
     lv.add_argument("--ui-url", help="the app's local URL, when it isn't printed (e.g. http://localhost:3000)")
+    df = sub.add_parser("diff", help="review what a PR, a branch, commits or uncommitted work changed in the structure")
+    df.add_argument("repo", help="a local checkout, or a GitHub URL / owner/repo / git URL")
+    df.add_argument("--from", "--base", dest="base",
+                    help="the old side: a branch, tag or commit (default: HEAD for the working tree, "
+                         "else where the head branched from the default branch)")
+    df.add_argument("--to", "--head", dest="head",
+                    help="the new side: a branch, tag, commit or `working` (default: `working` for a local "
+                         "folder, else the default branch)")
+    df.add_argument("--pr", type=int, help="a pull request number: compare it with where it branched from its base")
+    df.add_argument("--path", help="only compare this sub-folder")
+    df.add_argument("--out", help="output folder (default: one per range in the repo-graph cache)")
+    df.add_argument("--max-nodes", type=int, default=6000)
+    df.add_argument("--fail-on-findings", action="store_true",
+                    help="exit with status 2 when the review has anything under \"Check first\" (for CI)")
     s = sub.add_parser("search", help="find nodes by name/path")
     s.add_argument("dir")
     s.add_argument("query")
@@ -364,13 +440,14 @@ def main() -> None:
     s.add_argument("--limit", type=int, default=20)
     args = ap.parse_args()
 
-    if args.cmd == "build" or (args.cmd == "live" and not args.stop):
+    if args.cmd in ("build", "diff") or (args.cmd == "live" and not args.stop):
         ensure_dependencies()
     sys.path.insert(0, str(HERE))  # the bundled copy of the parser
     from repo_graph_mcp.fetch import FetchError
 
     try:
-        {"build": cmd_build, "explore": cmd_explore, "search": cmd_search, "live": cmd_live}[args.cmd](args)
+        {"build": cmd_build, "diff": cmd_diff, "explore": cmd_explore, "search": cmd_search,
+         "live": cmd_live}[args.cmd](args)
     except FetchError as e:
         sys.exit(f"repo-graph: {e}")
 

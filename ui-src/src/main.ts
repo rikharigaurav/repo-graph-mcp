@@ -168,7 +168,8 @@ function load(payload: Payload): void {
   }
   // version control: open on the uncommitted work when there is some
   history = ((payload as any).history as History | undefined) ?? null;
-  const working = history?.entries.find((e) => e.kind === "working" && e.diff);
+  // a comparison (a PR, a branch) opens on its changes, like uncommitted work does
+  const working = history?.entries.find((e) => (e.kind === "working" || e.kind === "range") && e.diff);
   marks = working ? marksFor(model, working) : null;
   mode = hasOverview && !payload.focus ? "overview" : "map";
   const live = (payload as any).live as { root: string; name: string; started: string; seq: number; interval: number; token?: string } | undefined;
@@ -206,6 +207,7 @@ function load(payload: Payload): void {
   applyMode(); // again, now that the view exists: the Live tab keeps room for its panel
   refresh(true);
   applyMarks();
+  if (history?.range && marks?.entry.kind === "range" && mode !== "live") openChanges(); // a review: show its list
   const focus = payload.focus ? model.byId.get(payload.focus) : null;
   if (focus && OPENABLE.has(focus.kind) && breakdown(focus).length) vis.opened.add(focus.id); // explore an agent → its breakdown
   if (focus && payload.focusDepth) {
@@ -318,6 +320,7 @@ function rowCounts(e: HistoryEntry): Map<OvItem, [number, number, number]> {
 
 function bannerLabel(e: HistoryEntry): string {
   if (e.kind === "working") return "uncommitted work";
+  if (e.kind === "range") return `${e.short} ${e.title}`;
   if (e.kind === "live") return e.label ?? liveLabel(e as LiveEvent);
   return `${e.short} ${e.title}`;
 }
@@ -582,6 +585,14 @@ function renderVcChip(): void {
   if (!history) return;
   const h = history;
   chip.replaceChildren();
+  if (h.range) {
+    chip.append(el("span", "vc-branch", h.range.label));
+    const files = h.entries[0]?.files.length ?? 0;
+    chip.append(el("span", "vc-badge is-ahead", `${files} file${files === 1 ? "" : "s"} changed`));
+    chip.setAttribute("aria-expanded", String(changesOpen));
+    chip.title = `${h.range.base_label} → ${h.range.head_label}`;
+    return;
+  }
   chip.append(el("span", "vc-branch", `${h.branch} @ ${h.short}`));
   const working = h.entries.find((e) => e.kind === "working");
   if (working) chip.append(el("span", "vc-badge is-dirty", `● ${working.files.length} uncommitted`));
@@ -640,7 +651,7 @@ function showChangesInMap(): void {
   for (const id of [...keep]) for (let a = model.byId.get(id)?.parent; a; a = a.parent) { keep.add(a.id); vis.collapsed.delete(a.id); }
   vis.focus = keep;
   const e = marks.entry;
-  focusLabel = e.kind === "working" ? "uncommitted changes" : e.kind === "live"
+  focusLabel = e.kind === "working" ? "uncommitted changes" : e.kind === "range" ? `changes in ${e.short}` : e.kind === "live"
     ? (e.id === "live-since" ? "changes in this live session" : `changes from ${e.title.replace(/^Edited /, "")}`)
     : `changes in ${e.short}`;
   setMode("map");
